@@ -1,7 +1,8 @@
 from flwr.server.strategy import FedAvg
 from wandb_logger import FederatedWandBLogger
+import torch
 
-class FedAvg(FedAvg):
+class FedAvgStandard(FedAvg):
     """
     Federated Averaging (FedAvg) strategy with integrated WandB logging.
 
@@ -71,4 +72,5 @@ class FedAvg(FedAvg):
             self.logger.log_global_metrics(aggregated_metrics, round_number=rnd)
 
         return aggregated_loss, aggregated_metrics
+
 
