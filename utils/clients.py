@@ -44,6 +44,7 @@ def build_client_fn(
     model_fn: Callable[[], nn.Module],
     device: torch_device,
     valset: Dataset,
+    batch_size: int,
     local_epochs: int = 1,
 ) -> Callable[[Context], Client]:
     """
@@ -60,6 +61,7 @@ def build_client_fn(
         model_fn (Callable): Function that returns a fresh model instance.
         device (torch.device): PyTorch device (CPU or CUDA).
         valset (Dataset): Shared global validation dataset.
+        batch_size (int): Batch Size for data.
         local_epochs (int): Number of local epochs to perform.
 
     Returns:
@@ -118,8 +120,8 @@ def build_client_fn(
 
         model = model_fn()
         print(f"{cid}-LOG: Model initialized for client {cid}")
-        trainloader = DataLoader(trainset, batch_size=64, shuffle=True)
-        valloader = DataLoader(valset, batch_size=64)
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+        valloader = DataLoader(valset, batch_size=batch_size)
         print(f"{cid}-LOG: Dataloaders initialized for client {cid}")
 
         return CIFARFederatedClient(
@@ -151,12 +153,14 @@ def build_client_fn_model_editing(
     model_fn: Callable[[], nn.Module],
     device: torch.device,
     valset: Dataset,
+    batch_size: int,
     local_epochs: int = 1,
     pruning_rounds: int = 4,
     final_sparsity: float = 0.9,
     num_batches: int = 3,
     momentum: float = 0.9,
-    weight_decay: float = 0.0005
+    weight_decay: float = 0.0005,
+    mask_recalibration_interval: int = 3
 ) -> Callable[[Context], Client]:
 
     def make_optimizer(
@@ -206,8 +210,8 @@ def build_client_fn_model_editing(
 
         model = model_fn()
         print(f"{cid}-LOG: Model initialized for client {cid}")
-        trainloader = DataLoader(trainset, batch_size=64, shuffle=True)
-        valloader = DataLoader(valset, batch_size=64)
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+        valloader = DataLoader(valset, batch_size=batch_size)
         print(f"{cid}-LOG: Dataloaders initialized for client {cid}")
 
         try:
@@ -228,7 +232,8 @@ def build_client_fn_model_editing(
                 final_sparsity=final_sparsity,
                 num_batches=num_batches,
                 momentum=momentum,
-                weight_decay=weight_decay
+                weight_decay=weight_decay,
+                mask_recalibration_interval=mask_recalibration_interval
             ).to_client()
             print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
         except Exception as e:
@@ -426,7 +431,8 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
         final_sparsity: float = 0.9,
         num_batches: int = 3,
         momentum: float = 0.9,
-        weight_decay: float = 0.0005
+        weight_decay: float = 0.0005,
+        mask_recalibration_interval: int = 3
     ):
         """
         Initialize the federated client with model editing capabilities.
@@ -449,6 +455,7 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
             num_batches (int): Number of batches for Fisher Information scoring.
             momentum (float): Momentum factor for the optimizer.
             weight_decay (float): Weight decay for the optimizer.
+            mask_recalibration_interval (int): Mask Recalibration interval.
         """
         self.cid=cid
         self.local_epochs = local_epochs
@@ -460,33 +467,45 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
         self.scaler = GradScaler()
         self.pruner = TaLoSPruner(model, device)
 
-        self.masks = iterative_pruning(
-            self.pruner,
-            dataloader=trainloader,
-            rounds=pruning_rounds,
-            final_sparsity=final_sparsity,
-            num_batches=num_batches
-        )
-
-        for idx, mask in enumerate(self.masks):
-            if mask is not None:
-                print(f"{self.cid}-LOG: Mask {idx}: Non-zero elements: {torch.sum(mask != 0)} / {mask.numel()}")
-            else:
-                print(f"{self.cid}-LOG: Mask {idx} is None!")
-
+        # Configurations for pruning
+        self.pruning_rounds = pruning_rounds
+        self.final_sparsity = final_sparsity
+        self.num_batches = num_batches
+        self.mask_recalibration_interval = mask_recalibration_interval
+        
+        # Initialize optimizer and scheduler
         self.optimizer = optimizer_fn(
             model=self.model,
             optimizer_type=optimizer_type,
             optimizer_config=optimizer_config,
-            masks=self.masks
         )
-        
         self.scheduler = scheduler_fn(self.optimizer, scheduler_type, scheduler_config)
+
+        # Initialize empty masks, will be recalibrated during training
+        self.masks = None
+
+    def recalibrate_masks(self):
+        """
+        Recomputes the Fisher Information Scores and generates new masks.
+        This is done every `mask_recalibration_interval` epochs.
+        """
+        print(f"{self.cid}-LOG: Recalibrating Masks")
+        
+        # Perform Fisher Scoring
+        self.pruner.score(self.trainloader, num_batches=self.num_batches)
+
+        # Generate new masks based on updated Fisher scores
+        self.masks = self.pruner.generate_masks(sparsity=self.final_sparsity)
+
+        # Log the non-zero elements in each mask
+        for idx, mask in enumerate(self.masks):
+            if mask is not None:
+                print(f"{self.cid}-LOG: Mask {idx}: Non-zero elements: {torch.sum(mask != 0)} / {mask.numel()}")
+
 
     def get_parameters(self, config):
         """Extract model parameters for sending to the server."""
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
-        print("🔍 [Client] get_parameters called.")
 
     def set_parameters(self, parameters):
         """Load model parameters from server."""
@@ -494,7 +513,6 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
         for k, v in zip(state_dict.keys(), parameters):
             state_dict[k] = torch.tensor(v)
         self.model.load_state_dict(state_dict)
-        print("🔍 [Client] set_parameters called.")
     
     def set_global_head(self, global_head_state_dict):
         """
@@ -503,51 +521,31 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
         Args:
             global_head_state_dict (OrderedDict): The state dictionary of the head.
         """
-        print("🔍 Applyed global head")
         head = self.model.head if hasattr(self.model, 'head') else self.model
         head.load_state_dict(global_head_state_dict)
-
-
-    def set_global_mask(self, global_mask):
-        """
-        Update the local mask with the global mask received from the server.
-
-        Args:
-            global_mask (Dict[str, torch.Tensor]): The global mask for sparsity control.
-        """
-        print("🔍 Applyed global mask")
-        for name, param in self.model.named_parameters():
-            if name in global_mask:
-                mask = global_mask[name].to(self.device)
-                self.masks[name] = mask
 
     def fit(self, parameters, config):
         """
         Train the local model for one round with Model Editing.
-        At the end of local training, it sends back Fisher Information scores
-        for global sensitivity calibration.
 
         Args:
             parameters (List[np.ndarray]): Weights from the global model.
             config (dict): Optional server-sent config.
 
         Returns:
-            Tuple: Updated weights, number of samples, training metrics, sensitivity scores.
+            Tuple: Updated weights, number of samples, training metrics.
         """
+        print(f"{self.cid}-LOG: Starting Local Training")
         self.set_parameters(parameters)
         self.model.train()
         correct, total, loss_total = 0, 0, 0.0
 
-        if "global_mask" in config:
-            self.set_global_mask(config["global_mask"])
-        
-        if "global_head" in config and config["global_head"] is not None:
-            self.set_global_head(config["global_head"])
-
-        # Initialize the Fisher Information dictionary
-        fisher_information = {name: torch.zeros_like(param) for name, param in self.model.named_parameters()}
-
         for epoch in range(self.local_epochs):
+            print(f"{self.cid}-LOG: Epoch {epoch + 1}/{self.local_epochs}")
+
+            if (epoch + 1) % self.mask_recalibration_interval == 0 or self.masks is None:
+                self.recalibrate_masks()
+
             for images, labels in self.trainloader:
                 images, labels = images.to(self.device), labels.to(self.device)
 
@@ -556,18 +554,13 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
                     outputs = self.model(images)
                     loss = self.criterion(outputs, labels)
 
-                # Apply the global mask during backpropagation
+                # Apply Mask only to the backbone during Backpropagation
                 self.scaler.scale(loss).backward()
-                
-                # Mask the gradients accordingly
-                for name, param in self.model.named_parameters():
-                    if name in self.masks and self.masks[name] is not None:
-                        param.grad *= self.masks[name]
 
-                # Update Fisher Information
-                for name, param in self.model.named_parameters():
-                    if param.grad is not None:
-                        fisher_information[name] += (param.grad ** 2) * len(labels)
+                if self.masks is not None:
+                    for idx, (name, param) in enumerate(self.model.named_parameters()):
+                        if "head" not in name and self.masks[idx] is not None:
+                            param.grad.data.mul_(self.masks[idx])
 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -578,19 +571,24 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
-        # Normalize the Fisher Information by total number of samples
-        for name in fisher_information:
-            fisher_information[name] /= total
+        sparse_updates = [
+            (param * mask if mask is not None else torch.zeros_like(param)).cpu().numpy()
+            for (name, param), mask in zip(self.model.named_parameters(), self.masks)
+            if "head" not in name
+        ]
 
-        # Convert Fisher Information to NumPy for transmission to the server
-        fisher_information_np = {k: v.cpu().numpy() for k, v in fisher_information.items()}
+        sparse_masks = [
+            mask.cpu().numpy() if mask is not None else None
+            for (name, mask) in zip(self.model.named_parameters(), self.masks)
+            if "head" not in name
+        ]
 
-        return self.get_parameters(config), total, {
+        print(f"{self.cid}-LOG: Training Complete - Loss: {loss_total / total:.4f} | Accuracy: {correct / total:.4f}")
+
+        return sparse_updates, sparse_masks, total, {
             "train_loss": loss_total / total,
-            "train_accuracy": correct / total,
-            "fisher_information": fisher_information_np
+            "train_accuracy": correct / total
         }
-
 
     def evaluate(self, parameters, config):
         """
@@ -603,6 +601,7 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
         Returns:
             Tuple: Validation loss, number of samples, validation metrics.
         """
+        print(f"{self.cid}-LOG: Starting Evaluation")
         self.set_parameters(parameters)
         self.model.eval()
         correct, total, loss_total = 0, 0, 0.0
@@ -618,8 +617,10 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
+        print(f"{self.cid}-LOG: Evaluation Complete - Val Loss: {loss_total / total:.4f} | Val Accuracy: {correct / total:.4f}")
         return loss_total / total, total, {
             "val_loss": loss_total / total,
             "val_accuracy": correct / total
         }
+
 
