@@ -1,5 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
+from collections import defaultdict
+import numpy as np
 from torch.optim import SGD
 
 
@@ -33,143 +37,93 @@ class SparseSGDM(SGD):
                     p.grad.data.mul_(self.masks[i].to(p.grad.device))
         super().step(closure)
 
+        
 class TaLoSPruner:
-    def __init__(self, model, device):
+    def __init__(self, model, device, final_sparsity=0.9, num_batches=3, rounds=4):
         self.model = model
         self.device = device
-        self.scores = {}
+        self.final_sparsity = final_sparsity
+        self.num_batches = num_batches
+        self.rounds = rounds
+        self.masks = None
 
-        # Verificare la struttura del modello
+        # Identify the head of the model (DINO ViT for example)
         if hasattr(model, 'head'):
+            print("🟢 Found model head. Pruning will be applied to the head only.")
             self.head = model.head
         else:
-            print("Attenzione: il modello non ha un attributo 'head'. Utilizzo l'intero modello.")
+            print("⚠️ No specific 'head' found. Applying pruning to the entire model.")
             self.head = model
 
-    def score(self, dataloader, num_batches=1):
-        self.model.eval()
+    def fisher_information(self, dataloader):
+        """
+        Computes the Fisher Information matrix for parameter sensitivity estimation.
+        Only parameters in the `head` are considered.
+        """
+        fisher_scores = {p: torch.zeros_like(p, device=self.device) for p in self.head.parameters()}
+        self.model.train()
 
-        # Inizializza dizionario dei punteggi
-        for p in self.head.parameters():
-            self.scores[p] = torch.zeros_like(p, device=self.device)
-
-        total_samples = 0
-
-        for batch_idx, (x, y) in enumerate(dataloader):
-            if batch_idx >= num_batches:
+        for batch_idx, (inputs, targets) in enumerate(dataloader):
+            if batch_idx >= self.num_batches:
                 break
-
-            x, y = x.to(self.device), y.to(self.device)
-
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
             self.model.zero_grad()
 
-            # Forward pass con gestione di diversi tipi di modelli
-            if hasattr(self.model, 'forward_features'):
-                with torch.no_grad():
-                    features = self.model.forward_features(x)
+            # Forward pass through the head
+            with autocast():
+                outputs = self.model(inputs)
+                loss = nn.CrossEntropyLoss()(outputs, targets)
 
-                # Gestisci diverse strutture di output
-                if features.ndim == 3:  # [B, seq_len, hidden_dim]
-                    cls_token = features[:, 0, :]  # Prendi solo il CLS token
-                else:
-                    cls_token = features  # Già nella forma corretta
-
-                # Forward pass solo sulla testa
-                output = self.head(cls_token)
-            else:
-                # Se il modello non ha forward_features, usa il forward normale
-                self.model.zero_grad()
-                output = self.model(x)
-
-            # Adatta l'output se necessario
-            if output.ndim == 3:
-                output = output.squeeze(1)
-
-            # Calcolo della loss
-            loss = nn.CrossEntropyLoss()(output, y)
-
-            # Backward per calcolare i gradienti
             loss.backward()
 
-            # Accumula i punteggi (Fisher diagonale approssimato)
+            # Accumulate the Fisher Information scores
             for p in self.head.parameters():
                 if p.grad is not None:
-                    self.scores[p] += (p.grad.data ** 2) * x.size(0)
+                    fisher_scores[p] += (p.grad.data ** 2) * inputs.size(0)
 
-            total_samples += x.size(0)
+        # Normalize the scores
+        for p in fisher_scores:
+            fisher_scores[p] /= self.num_batches
 
-        # Normalizza i punteggi
-        for p in self.head.parameters():
-            if p in self.scores and total_samples > 0:
-                self.scores[p] /= total_samples
+        return fisher_scores
 
-
-    def generate_masks(self, sparsity=0.5):
+    def calibrate_masks(self, dataloader):
         """
-        Generate binary masks based on the Fisher Information scores.
-
-        Args:
-            sparsity (float): Fraction of parameters to prune (0 < sparsity < 1).
-
-        Returns:
-            list: Binary masks for each parameter in the head.
+        Multi-round mask calibration to refine parameter selection.
+        Only parameters in the `head` are considered for pruning.
         """
-        masks = []
+        print(f"🔎 Starting multi-round calibration for the model head only.")
+        for round_num in range(self.rounds):
+            print(f"🌀 Calibration Round {round_num + 1}/{self.rounds}")
+            fisher_scores = self.fisher_information(dataloader)
 
-        for p in self.head.parameters():
-            if p in self.scores:
-                score = self.scores[p]
+            # Flatten and sort by sensitivity
+            all_scores = []
+            for param, score in fisher_scores.items():
+                all_scores.append((score.flatten(), param))
 
-                if torch.all(score == 0):
-                    print(f"[Warning] All scores are zero for parameter of shape {p.shape}.")
-                    masks.append(torch.ones_like(p, device=self.device))
-                    continue
+            all_scores.sort(key=lambda x: x[0].mean(), reverse=True)
 
-                # Compute the pruning threshold
-                threshold = torch.quantile(score.flatten(), sparsity)
-                mask = (score >= threshold).float()
+            # Update sparsity for this round
+            current_sparsity = self.final_sparsity * (round_num + 1) / self.rounds
+            total_params = sum(p.numel() for p in self.head.parameters())
+            num_keep = int((1 - current_sparsity) * total_params)
 
-                # Ensure a minimum of 5% of weights are kept
-                keep_percent = mask.sum() / mask.numel()
-                if keep_percent < 0.05:
-                    print(f"[Warning] Only {keep_percent:.2%} of weights are kept, adjusting...")
-                    top_k = max(int(0.05 * mask.numel()), 1)
-                    values, _ = torch.topk(score.flatten(), top_k)
-                    threshold = values.min()
-                    mask = (score >= threshold).float()
+            # Generate masks
+            self.masks = []
+            for score, param in all_scores:
+                threshold = torch.quantile(score, current_sparsity)
+                mask = (score >= threshold).float().reshape(param.shape).to(self.device)
+                self.masks.append(mask)
 
-                masks.append(mask)
+            # Apply the new masks
+            self.apply_masks()
+            print(f"✅ Mask updated with {current_sparsity * 100:.2f}% sparsity")
 
-        return masks
-
-
-
-def iterative_pruning(pruner, dataloader, rounds=4, final_sparsity=0.9, num_batches=3):
-    """
-    Perform iterative pruning over multiple rounds, progressively increasing sparsity.
-
-    Args:
-        pruner (TaLoSPruner): Instance of the TaLoSPruner.
-        dataloader (DataLoader): DataLoader for scoring.
-        rounds (int): Number of pruning rounds.
-        final_sparsity (float): Final sparsity ratio (0 < sparsity < 1).
-        num_batches (int): Number of batches to score for each round.
-
-    Returns:
-        list: Final binary masks after iterative pruning.
-    """
-    keep_ratio = 1.0 - final_sparsity
-
-    for r in range(rounds):
-        current_keep = keep_ratio ** ((r + 1) / rounds)
-        current_sparsity = 1.0 - current_keep
-        print(f"[Round {r + 1}/{rounds}] Target sparsity: {current_sparsity:.4f}")
-
-        # Compute Fisher scores
-        pruner.score(dataloader, num_batches=num_batches)
-
-        # Generate masks based on the scores
-        masks = pruner.generate_masks(sparsity=current_sparsity)
-
-    return masks
-
+    def apply_masks(self):
+        """
+        Apply the binary masks to the head parameters only.
+        """
+        with torch.no_grad():
+            for mask, param in zip(self.masks, self.head.parameters()):
+                param.data *= mask
