@@ -1,6 +1,7 @@
 from flwr.server.strategy import FedAvg
 from wandb_logger import FederatedWandBLogger
 import torch
+from flwr.common import parameters_to_ndarrays
 
 class FedAvgStandard(FedAvg):
     """
@@ -72,5 +73,3 @@ class FedAvgStandard(FedAvg):
             self.logger.log_global_metrics(aggregated_metrics, round_number=rnd)
 
         return aggregated_loss, aggregated_metrics
-
-
