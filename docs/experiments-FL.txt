@@ -1,0 +1,42 @@
+Experiment: Federated Learning - IID Data
+Optimizer: SGD
+  - Learning Rate: 0.03
+  - Momentum: 0.9
+  - Weight Decay: 1e-4
+Scheduler: Cosine Annealing
+  - T_max: 8
+  - Eta_min: 1e-6
+Batch Size: 32 (per client, maybe too small, do more steps or round, or put it bigger)
+Local Steps (J): 4
+Global Rounds: 8
+Clients (K): 100
+Fraction of Clients (C): 0.1
+Validation Split: 0.1 (per client)
+Backbone Frozen: Yes
+Data Sharding: IID 
+
+Experiment: Federated Learning - Non-IID Data
+Optimizer: SGD
+  - Learning Rate: 0.03
+  - Momentum: 0.9
+  - Weight Decay: 1e-4
+Scheduler: Cosine Annealing
+  - T_max: 8
+  - Eta_min: 1e-6
+Batch Size: 32 (per client, maybe too small, do more steps or round, or put it bigger)
+Global Rounds: Adapt based on Local Steps (J)
+Clients (K): 100
+Fraction of Clients (C): 0.1
+Validation Split: 0.1 (per client)
+Backbone Frozen: Yes
+Data Sharding: Non-IID
+  - Run with different label distributions per client:
+    - Nc=1 (clients have data from a single class)
+    - Nc=5 (clients have data from 5 classes)
+    - Nc=10 (clients have data from 10 classes)
+    - Nc=50 (clients have data from 50 classes)
+  - Local Steps (J): 4, 8, 16
+    - If J=4 → Global Rounds = 8
+    - If J=8 → Global Rounds = 4
+    - If J=16 → Global Rounds = 2
+
