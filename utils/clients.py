@@ -12,8 +12,9 @@ from enum import Enum
 from torch import device as torch_device
 from flwr.client import Client
 from torch.cuda.amp import GradScaler, autocast
-from editing import SparseSGDM, TaLoSPruner, iterative_pruning
+from editing import SparseSGDM, TaLoSPruner
 from torch.optim import Optimizer
+import numpy as np
 
 class OptimizerType(Enum):
     SSGD = "ssgd"
@@ -141,106 +142,6 @@ def build_client_fn(
         print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
 
     return client_fn
-
-def build_client_fn_model_editing(
-    use_iid: bool,
-    optimizer_type: OptimizerType,
-    scheduler_type: SchedulerType,
-    optimizer_config: Dict,
-    scheduler_config: Dict,
-    iid_partitions: List[Dataset],
-    non_iid_partitions: List[Dataset],
-    model_fn: Callable[[], nn.Module],
-    device: torch.device,
-    valset: Dataset,
-    batch_size: int,
-    local_epochs: int = 1,
-    pruning_rounds: int = 4,
-    final_sparsity: float = 0.9,
-    num_batches: int = 3,
-    momentum: float = 0.9,
-    weight_decay: float = 0.0005,
-    mask_recalibration_interval: int = 3
-) -> Callable[[Context], Client]:
-
-    def make_optimizer(
-        model: torch.nn.Module,
-        optimizer_type: str,
-        optimizer_config: dict,
-        masks: list = None
-    ) -> Optimizer:
-        if optimizer_type == OptimizerType.SSGD:
-            return SparseSGDM(
-                model.parameters(),
-                lr=optimizer_config.get("lr", 0.01),
-                momentum=optimizer_config.get("momentum", 0.9),
-                weight_decay=optimizer_config.get("weight_decay", 0.0005),
-                masks=masks
-            )
-        else:
-            raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
-
-    def make_scheduler(optimizer: optim.Optimizer, scheduler_type: str, scheduler_config: dict) -> optim.lr_scheduler._LRScheduler:
-        if scheduler_type == SchedulerType.COSINE:
-            return optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.COSINE_RESTART:
-            return optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.STEP:
-            return optim.lr_scheduler.StepLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.MULTISTEP:
-            return optim.lr_scheduler.MultiStepLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.EXPONENTIAL:
-            return optim.lr_scheduler.ExponentialLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.REDUCE_ON_PLATEAU:
-            return optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.CONSTANT:
-            return optim.lr_scheduler.ConstantLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.LINEAR:
-            return optim.lr_scheduler.LinearLR(optimizer, **scheduler_config)
-        else:
-            raise ValueError(f"Unsupported scheduler: {scheduler_type}")
-
-    def client_fn(context: Context) -> Client:
-        cid = int(context.node_config["partition-id"])
-        print(f"LOG: Initializing client with CID={cid}")
-
-        trainset = iid_partitions[cid] if use_iid else non_iid_partitions[cid]
-        print(f"{cid}-LOG: Data partition assigned to client {cid} -> {'IID' if use_iid else 'Non-IID'}")
-
-
-        model = model_fn()
-        print(f"{cid}-LOG: Model initialized for client {cid}")
-        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
-        valloader = DataLoader(valset, batch_size=batch_size)
-        print(f"{cid}-LOG: Dataloaders initialized for client {cid}")
-
-        try:
-            return CIFARFederatedClientModelEditing(
-                cid=cid,
-                model=model,
-                trainloader=trainloader,
-                valloader=valloader,
-                device=device,
-                optimizer_fn=make_optimizer,
-                optimizer_type=optimizer_type,
-                scheduler_type=scheduler_type,
-                optimizer_config=optimizer_config,
-                scheduler_config=scheduler_config,
-                scheduler_fn=make_scheduler,
-                local_epochs=local_epochs,
-                pruning_rounds=pruning_rounds,
-                final_sparsity=final_sparsity,
-                num_batches=num_batches,
-                momentum=momentum,
-                weight_decay=weight_decay,
-                mask_recalibration_interval=mask_recalibration_interval
-            ).to_client()
-            print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
-        except Exception as e:
-            raise e
-
-    return client_fn
-
 
 class CIFARFederatedClient(fl.client.NumPyClient):
     """
@@ -405,147 +306,159 @@ class CIFARFederatedClient(fl.client.NumPyClient):
             "val_accuracy": val_accuracy
         }
 
-class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
+
+def build_client_talos_fn(
+    use_iid: bool,
+    scheduler_type: SchedulerType,
+    optimizer_config: Dict,
+    scheduler_config: Dict,
+    iid_partitions: List[Dataset],
+    non_iid_partitions: List[Dataset],
+    model_fn: Callable[[], nn.Module],
+    device: torch_device,
+    valset: Dataset,
+    batch_size: int,
+    talos_config: dict,
+    local_epochs: int = 1,
+) -> Callable[[Context], Client]:
+
+    def make_scheduler(optimizer: optim.Optimizer, scheduler_type: SchedulerType, scheduler_config: dict) -> optim.lr_scheduler._LRScheduler:
+        if scheduler_type == SchedulerType.COSINE:
+            return optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.COSINE_RESTART:
+            return optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.STEP:
+            return optim.lr_scheduler.StepLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.MULTISTEP:
+            return optim.lr_scheduler.MultiStepLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.EXPONENTIAL:
+            return optim.lr_scheduler.ExponentialLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.REDUCE_ON_PLATEAU:
+            return optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.CONSTANT:
+            return optim.lr_scheduler.ConstantLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.LINEAR:
+            return optim.lr_scheduler.LinearLR(optimizer, **scheduler_config)
+        else:
+            raise ValueError(f"Unsupported scheduler: {scheduler_type}")
+
+    def client_fn(context: Context) -> Client:
+        """
+        Construct a client instance based on the context provided by Flower.
+
+        Args:
+            context (Context): Context object including the client's partition ID.
+
+        Returns:
+            fl.client.Client: A fully initialized Flower client.
+        """
+        cid = int(context.node_config["partition-id"])
+        print(f"LOG: Initializing client with CID={cid}")
+        
+        trainset = iid_partitions[cid] if use_iid else non_iid_partitions[cid]
+        print(f"{cid}-LOG: Data partition assigned to client {cid} -> {'IID' if use_iid else 'Non-IID'}")
+
+        model = model_fn()
+        print(f"{cid}-LOG: Model initialized for client {cid}")
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+        valloader = DataLoader(valset, batch_size=batch_size)
+        print(f"{cid}-LOG: Dataloaders initialized for client {cid}")
+
+        return CIFARTaLoSClient(
+            cid=cid,
+            model=model,
+            trainloader=trainloader,
+            valloader=valloader,
+            device=device,
+            optimizer_config=optimizer_config,
+            scheduler_config=scheduler_config,
+            scheduler_type=scheduler_type,
+            scheduler_fn=make_scheduler,
+            local_epochs=local_epochs,
+            talos_config=talos_config
+        ).to_client()
+        print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
+
+    return client_fn
+
+
+class CIFARTaLoSClient(fl.client.NumPyClient):
     """
-    Federated client for CIFAR-based image classification with Model Editing.
-    This client supports:
-    - Sparse Fine-Tuning with Masked Gradient Updates.
-    - Iterative Pruning to refine masks over local epochs.
+    A Federated Learning client that uses TaLoS Model Editing during local updates.
     """
 
     def __init__(
         self,
         cid,
-        model: nn.Module,
+        model: torch.nn.Module,
         trainloader: torch.utils.data.DataLoader,
         valloader: torch.utils.data.DataLoader,
         device: torch.device,
-        optimizer_config: dict,
-        scheduler_config: dict,
-        optimizer_type: OptimizerType,
         scheduler_type: SchedulerType,
-        optimizer_fn: Callable[[nn.Module], torch.optim.Optimizer],
+        scheduler_config: dict,
+        optimizer_config: dict,
+        talos_config: dict,
         scheduler_fn: Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler._LRScheduler],
         local_epochs: int,
-        pruning_rounds: int = 4,
-        final_sparsity: float = 0.9,
-        num_batches: int = 3,
-        momentum: float = 0.9,
-        weight_decay: float = 0.0005,
-        mask_recalibration_interval: int = 3
-    ):
-        """
-        Initialize the federated client with model editing capabilities.
 
-        Args:
-            cid: Client id.
-            model (nn.Module): PyTorch model instance.
-            trainloader (DataLoader): Training dataloader.
-            valloader (DataLoader): Validation dataloader.
-            device (torch.device): Device to run training on (CPU or CUDA).
-            scheduler_config (dict): Configuration parameters for the scheduler.
-            optimizer_config (dict): Configuration parameters for the optimizer.
-            optimizer_type (OptimizerType): Enum specifying the optimizer to use.
-            scheduler_type (SchedulerType): Enum specifying the scheduler to use.
-            optimizer_fn (Callable): Function that returns an optimizer when given a model.
-            scheduler_fn (Callable): Function that returns a scheduler when given an optimizer.
-            local_epochs (int): Number of local epochs to perform.
-            pruning_rounds (int): Number of rounds for iterative pruning.
-            final_sparsity (float): Final sparsity level (0 < sparsity < 1).
-            num_batches (int): Number of batches for Fisher Information scoring.
-            momentum (float): Momentum factor for the optimizer.
-            weight_decay (float): Weight decay for the optimizer.
-            mask_recalibration_interval (int): Mask Recalibration interval.
-        """
-        self.cid=cid
-        self.local_epochs = local_epochs
-        self.device = device
+    ):
+        self.cid = cid
+        self.model = model.to(device)
         self.trainloader = trainloader
         self.valloader = valloader
+        self.device = device
+        self.local_epochs = local_epochs
         self.criterion = nn.CrossEntropyLoss()
-        self.model = model.to(device)
         self.scaler = GradScaler()
-        self.pruner = TaLoSPruner(model, device)
 
-        # Configurations for pruning
-        self.pruning_rounds = pruning_rounds
-        self.final_sparsity = final_sparsity
-        self.num_batches = num_batches
-        self.mask_recalibration_interval = mask_recalibration_interval
-        
-        # Initialize optimizer and scheduler
-        self.optimizer = optimizer_fn(
+        self.pruner = TaLoSPruner(
             model=self.model,
-            optimizer_type=optimizer_type,
-            optimizer_config=optimizer_config,
+            device=self.device,
+            final_sparsity=talos_config["final_sparsity"],
+            num_batches=talos_config["num_batches"],
+            rounds=talos_config["rounds"]
+        )
+        
+        print(f"{self.cid}-LOG: Starting TaLoS Mask Calibration")
+        self.pruner.calibrate_masks(self.trainloader)
+        
+        self.pruner.apply_masks()
+
+        self.optimizer = SparseSGDM(
+            params=self.model.head.parameters(),  # Use only head parameters
+            lr=optimizer_config["lr"],
+            momentum=optimizer_config["momentum"],
+            weight_decay=optimizer_config["weight_decay"],
+            masks=self.pruner.masks
         )
         self.scheduler = scheduler_fn(self.optimizer, scheduler_type, scheduler_config)
-
-        # Initialize empty masks, will be recalibrated during training
-        self.masks = None
-
-    def recalibrate_masks(self):
-        """
-        Recomputes the Fisher Information Scores and generates new masks.
-        This is done every `mask_recalibration_interval` epochs.
-        """
-        print(f"{self.cid}-LOG: Recalibrating Masks")
         
-        # Perform Fisher Scoring
-        self.pruner.score(self.trainloader, num_batches=self.num_batches)
-
-        # Generate new masks based on updated Fisher scores
-        self.masks = self.pruner.generate_masks(sparsity=self.final_sparsity)
-
-        # Log the non-zero elements in each mask
-        for idx, mask in enumerate(self.masks):
-            if mask is not None:
-                print(f"{self.cid}-LOG: Mask {idx}: Non-zero elements: {torch.sum(mask != 0)} / {mask.numel()}")
-
-
     def get_parameters(self, config):
-        """Extract model parameters for sending to the server."""
+        """
+        Extract model parameters for sending to the server.
+        """
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
-        """Load model parameters from server."""
+        """
+        Load model parameters from server.
+        """
         state_dict = self.model.state_dict()
         for k, v in zip(state_dict.keys(), parameters):
             state_dict[k] = torch.tensor(v)
         self.model.load_state_dict(state_dict)
-    
-    def set_global_head(self, global_head_state_dict):
-        """
-        Apply the global head from the server to the local model.
-
-        Args:
-            global_head_state_dict (OrderedDict): The state dictionary of the head.
-        """
-        head = self.model.head if hasattr(self.model, 'head') else self.model
-        head.load_state_dict(global_head_state_dict)
 
     def fit(self, parameters, config):
         """
-        Train the local model for one round with Model Editing.
-
-        Args:
-            parameters (List[np.ndarray]): Weights from the global model.
-            config (dict): Optional server-sent config.
-
-        Returns:
-            Tuple: Updated weights, number of samples, training metrics.
+        Train the local model with TaLoS model editing for one round.
         """
-        print(f"{self.cid}-LOG: Starting Local Training")
+        print(f"{self.cid}-LOG: Starting local training round with TaLoS")
         self.set_parameters(parameters)
         self.model.train()
         correct, total, loss_total = 0, 0, 0.0
 
         for epoch in range(self.local_epochs):
-            print(f"{self.cid}-LOG: Epoch {epoch + 1}/{self.local_epochs}")
-
-            if (epoch + 1) % self.mask_recalibration_interval == 0 or self.masks is None:
-                self.recalibrate_masks()
-
+            print(f"{self.cid}-LOG: Starting epoch {epoch + 1}/{self.local_epochs}")
             for images, labels in self.trainloader:
                 images, labels = images.to(self.device), labels.to(self.device)
 
@@ -554,54 +467,29 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
                     outputs = self.model(images)
                     loss = self.criterion(outputs, labels)
 
-                # Apply Mask only to the backbone during Backpropagation
                 self.scaler.scale(loss).backward()
-
-                if self.masks is not None:
-                    for idx, (name, param) in enumerate(self.model.named_parameters()):
-                        if "head" not in name and self.masks[idx] is not None:
-                            param.grad.data.mul_(self.masks[idx])
-
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                self.scheduler.step()
 
                 loss_total += loss.item() * labels.size(0)
                 _, predicted = torch.max(outputs, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
-        sparse_updates = [
-            (param * mask if mask is not None else torch.zeros_like(param)).cpu().numpy()
-            for (name, param), mask in zip(self.model.named_parameters(), self.masks)
-            if "head" not in name
-        ]
+        train_loss = loss_total / total
+        train_accuracy = correct / total
+        print(f"{self.cid}-LOG: Completed local training - Loss: {train_loss:.4f} | Accuracy: {train_accuracy:.4f}")
 
-        sparse_masks = [
-            mask.cpu().numpy() if mask is not None else None
-            for (name, mask) in zip(self.model.named_parameters(), self.masks)
-            if "head" not in name
-        ]
-
-        print(f"{self.cid}-LOG: Training Complete - Loss: {loss_total / total:.4f} | Accuracy: {correct / total:.4f}")
-
-        return sparse_updates, sparse_masks, total, {
-            "train_loss": loss_total / total,
-            "train_accuracy": correct / total
+        return self.get_parameters(config), total, {
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy
         }
 
     def evaluate(self, parameters, config):
         """
         Evaluate the model on the client's validation data.
-
-        Args:
-            parameters (List[np.ndarray]): Global model weights.
-            config (dict): Optional server config.
-
-        Returns:
-            Tuple: Validation loss, number of samples, validation metrics.
         """
-        print(f"{self.cid}-LOG: Starting Evaluation")
+        print(f"{self.cid}-LOG: Starting evaluation")
         self.set_parameters(parameters)
         self.model.eval()
         correct, total, loss_total = 0, 0, 0.0
@@ -617,10 +505,11 @@ class CIFARFederatedClientModelEditing(fl.client.NumPyClient):
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
-        print(f"{self.cid}-LOG: Evaluation Complete - Val Loss: {loss_total / total:.4f} | Val Accuracy: {correct / total:.4f}")
-        return loss_total / total, total, {
-            "val_loss": loss_total / total,
-            "val_accuracy": correct / total
+        val_loss = loss_total / total
+        val_accuracy = correct / total
+        print(f"{self.cid}-LOG: Evaluation completed - Val Loss: {val_loss:.4f} | Val Accuracy: {val_accuracy:.4f}")
+
+        return val_loss, total, {
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy
         }
-
-
