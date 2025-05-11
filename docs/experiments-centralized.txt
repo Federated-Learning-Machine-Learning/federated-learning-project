@@ -1,0 +1,42 @@
+Experiment: Centralized Training Baseline - SGD + Cosine Annealing
+Optimizer: SGD
+  - Learning Rate: 0.03
+  - Momentum: 0.9
+  - Weight Decay: 1e-4
+Scheduler: Cosine Annealing
+  - T_max: 100
+  - Eta_min: 1e-6
+Batch Size: 128
+Epochs: 100
+Validation Split: 0.1
+Backbone Frozen: No
+Reference: https://arxiv.org/abs/1801.01523 (CIFAR-100 benchmarks with SGD and Cosine Annealing)
+
+
+Experiment: Centralized Training Baseline - Adam + Cosine Annealing Warm Restarts
+Optimizer: Adam
+  - Learning Rate: 0.001
+  - Betas: (0.9, 0.999)
+  - Weight Decay: 1e-4
+Scheduler: Cosine Annealing Warm Restarts
+  - T_0: 10
+  - T_mult: 2
+Batch Size: 128
+Epochs: 100
+Validation Split: 0.1
+Backbone Frozen: No
+Reference: https://arxiv.org/abs/1810.12890 (Transformer fine-tuning on CIFAR-100 with Adam and Cosine Annealing Warm Restarts)
+
+Experiment: Centralized Training Baseline - Ranger (RAdam + Lookahead) + OneCycleLR
+Optimizer: Ranger (RAdam + Lookahead)
+  - Learning Rate: 0.003
+  - Betas: (0.95, 0.999)
+  - Weight Decay: 1e-4
+Scheduler: OneCycleLR
+  - Max LR: 0.003
+  - Total Steps: 100
+Batch Size: 128
+Epochs: 100
+Validation Split: 0.1
+Backbone Frozen: No
+Reference: https://arxiv.org/abs/1908.03265 (Ranger optimization on CIFAR-100)
