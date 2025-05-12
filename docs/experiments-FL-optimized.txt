@@ -1,0 +1,43 @@
+Experiment: Federated Learning - FedProx (Non-IID)
+Optimizer: SGD
+  - Learning Rate: 0.03
+  - Momentum: 0.9
+  - Weight Decay: 1e-4
+Scheduler: Cosine Annealing
+  - T_max: 8
+  - Eta_min: 1e-6
+Batch Size: 32 (per client)
+Local Steps (J): 4, 8, 16 (scaled accordingly)
+Global Rounds: 8, 4, 2 (respectively with J)
+Clients (K): 100
+Fraction of Clients (C): 0.1
+Validation Split: 0.1 (per client)
+Backbone Frozen: Yes
+Data Sharding: Non-IID (Nc=1, 5, 10, 50)
+Proximal Term (μ): 0.1
+Reference: https://arxiv.org/abs/1812.06127
+
+Experiment: Federated Learning - Yogi (Non-IID)
+Optimizer: SGD
+  - Learning Rate: 0.03
+  - Momentum: 0.9
+  - Weight Decay: 1e-4
+Scheduler: Cosine Annealing
+  - T_max: 8
+  - Eta_min: 1e-6
+Batch Size: 32 (per client)
+Local Steps (J): 4, 8, 16 (scaled accordingly)
+Global Rounds: 8, 4, 2 (respectively with J)
+Clients (K): 100
+Fraction of Clients (C): 0.1
+Validation Split: 0.1 (per client)
+Backbone Frozen: Yes
+Data Sharding: Non-IID (Nc=1, 5, 10, 50)
+Learning Rate: 0.01
+Beta1: 0.9
+Beta2: 0.999
+Tau: 0.1
+Reference: https://arxiv.org/abs/1812.06127
+
+Experiment: Federated Learning - Yogi + FedProx
+Use FedProx Client and Yogi together
