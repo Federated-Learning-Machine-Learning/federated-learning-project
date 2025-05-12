@@ -87,7 +87,7 @@ class TaLoSPruner:
 
         return fisher_scores
 
-    def calibrate_masks(self, dataloader):
+    def calibrate_masks(self, dataloader, strategy="least_sensitive"):
         """
         Multi-round mask calibration to refine parameter selection.
         Only parameters in the `head` are considered for pruning.
@@ -111,19 +111,26 @@ class TaLoSPruner:
 
             # Generate masks
             self.masks = []
-            for score, param in all_scores:
-                threshold = torch.quantile(score, current_sparsity)
-                mask = (score >= threshold).float().reshape(param.shape).to(self.device)
-                self.masks.append(mask)
+            strategy = strategy.lower()
+            if strategy == "least_sensitive":
+                for score, param in all_scores:
+                    threshold = torch.quantile(score, 1 - current_sparsity) 
+                    mask = (score <= threshold).float().reshape(param.shape).to(self.device) #keeps weights with score lower than threshold
+                    self.masks.append(mask)
+            if strategy == "most_sensitive":
+                for score, param in all_scores:
+                    threshold = torch.quantile(score, current_sparsity)
+                    mask = (score >= threshold).float().reshape(param.shape).to(self.device)
+                    self.masks.append(mask)
 
             # Apply the new masks
-            self.apply_masks()
+            #self.apply_masks()
             print(f"✅ Mask updated with {current_sparsity * 100:.2f}% sparsity")
 
-    def apply_masks(self):
-        """
-        Apply the binary masks to the head parameters only.
-        """
+    """def apply_masks(self):
+        
+        #Apply the binary masks to the head parameters only.
+        
         with torch.no_grad():
             for mask, param in zip(self.masks, self.head.parameters()):
-                param.data *= mask
+                param.data *= mask"""
