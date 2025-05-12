@@ -401,7 +401,7 @@ def build_client_fedprox_fn(
 
     return client_fn
 
-class CIFARFederatedProxClient(fl.client.NumPyClient):
+class CIFARFederatedProxClient(CIFARFederatedClient):
     def __init__(
         self,
         cid,
