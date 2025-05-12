@@ -16,6 +16,11 @@ from editing import SparseSGDM, TaLoSPruner
 from torch.optim import Optimizer
 import numpy as np
 
+class ClientType(Enum):
+    STANDARD = "standard"
+    FEDPROX = "fedprox"
+    TALOS = "talos"
+
 class OptimizerType(Enum):
     SSGD = "ssgd"
     SGD = "sgd"
@@ -306,6 +311,173 @@ class CIFARFederatedClient(fl.client.NumPyClient):
             "val_accuracy": val_accuracy
         }
 
+def build_client_fedprox_fn(
+    use_iid: bool,
+    optimizer_type: OptimizerType,
+    scheduler_type: SchedulerType,
+    optimizer_config: Dict,
+    scheduler_config: Dict,
+    iid_partitions: List[Dataset],
+    non_iid_partitions: List[Dataset],
+    model_fn: Callable[[], nn.Module],
+    device: torch_device,
+    valset: Dataset,
+    batch_size: int,
+    mu: int = 0.1,
+    local_epochs: int = 1,
+) -> Callable[[Context], Client]:
+    def make_optimizer(model: nn.Module, optimizer_type: OptimizerType, optimizer_config: dict) -> optim.Optimizer:
+        if optimizer_type == OptimizerType.SGD:
+            return optim.SGD(model.parameters(), **optimizer_config)
+        elif optimizer_type == OptimizerType.ADAM:
+            return optim.Adam(model.parameters(), **optimizer_config)
+        elif optimizer_type == OptimizerType.ADAMW:
+            return optim.AdamW(model.parameters(), **optimizer_config)
+        elif optimizer_type == OptimizerType.RMSPROP:
+            return optim.RMSprop(model.parameters(), **optimizer_config)
+        elif optimizer_type == OptimizerType.ADAGRAD:
+            return optim.Adagrad(model.parameters(), **optimizer_config)
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_type}")
+
+    def make_scheduler(optimizer: optim.Optimizer, scheduler_type: SchedulerType, scheduler_config: dict) -> optim.lr_scheduler._LRScheduler:
+        if scheduler_type == SchedulerType.COSINE:
+            return optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.COSINE_RESTART:
+            return optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.STEP:
+            return optim.lr_scheduler.StepLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.MULTISTEP:
+            return optim.lr_scheduler.MultiStepLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.EXPONENTIAL:
+            return optim.lr_scheduler.ExponentialLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.REDUCE_ON_PLATEAU:
+            return optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.CONSTANT:
+            return optim.lr_scheduler.ConstantLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.LINEAR:
+            return optim.lr_scheduler.LinearLR(optimizer, **scheduler_config)
+        else:
+            raise ValueError(f"Unsupported scheduler: {scheduler_type}")
+
+    def client_fn(context: Context) -> Client:
+        """
+        Construct a client instance based on the context provided by Flower.
+
+        Args:
+            context (Context): Context object including the client's partition ID.
+
+        Returns:
+            fl.client.Client: A fully initialized Flower client.
+        """
+        cid = int(context.node_config["partition-id"])
+        print(f"LOG: Initializing client with CID={cid}")
+        
+        trainset = iid_partitions[cid] if use_iid else non_iid_partitions[cid]
+        print(f"{cid}-LOG: Data partition assigned to client {cid} -> {'IID' if use_iid else 'Non-IID'}")
+
+        model = model_fn()
+        print(f"{cid}-LOG: Model initialized for client {cid}")
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+        valloader = DataLoader(valset, batch_size=batch_size)
+        print(f"{cid}-LOG: Dataloaders initialized for client {cid}")
+
+        return CIFARFederatedProxClient(
+            cid=cid,
+            model=model,
+            trainloader=trainloader,
+            valloader=valloader,
+            device=device,
+            optimizer_config=optimizer_config,
+            optimizer_type=optimizer_type,
+            scheduler_config=scheduler_config,
+            scheduler_type=scheduler_type,
+            optimizer_fn=make_optimizer,
+            scheduler_fn=make_scheduler,
+            local_epochs=local_epochs,
+            mu=mu
+        ).to_client()
+        print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
+
+    return client_fn
+
+class CIFARFederatedProxClient(fl.client.NumPyClient):
+    def __init__(
+        self,
+        cid,
+        model: nn.Module,
+        trainloader: torch.utils.data.DataLoader,
+        valloader: torch.utils.data.DataLoader,
+        device: torch.device,
+        optimizer_type,
+        scheduler_type,
+        optimizer_config: dict,
+        scheduler_config: dict,
+        optimizer_fn,
+        scheduler_fn,
+        local_epochs: int,
+        mu: float = 0.1 
+    ):
+        super().__init__(cid, model, trainloader, valloader, device, optimizer_type, 
+                         scheduler_type, optimizer_config, scheduler_config,
+                         optimizer_fn, scheduler_fn, local_epochs)
+        
+        self.mu = mu
+
+    def fit(self, parameters, config):
+        """
+        Train the local model for one round with FedProx regularization.
+
+        Args:
+            parameters (List[np.ndarray]): Weights from the global model.
+            config (dict): Optional server-sent config (unused here).
+
+        Returns:
+            Tuple: Updated weights, number of samples, training metrics.
+        """
+        print(f"{self.cid}-LOG: Starting local training round with FedProx (mu={self.mu})")
+        
+        self.set_parameters(parameters)
+        self.model.train()
+        correct, total, loss_total = 0, 0, 0.0
+
+        # Save the initial global model weights for Proximal Term computation
+        global_weights = [p.clone().detach() for p in self.model.parameters()]
+
+        for epoch in range(self.local_epochs):
+            print(f"{self.cid}-LOG: Starting epoch {epoch + 1}/{self.local_epochs}")
+            for images, labels in self.trainloader:
+                images, labels = images.to(self.device), labels.to(self.device)
+
+                self.optimizer.zero_grad()
+                with autocast():
+                    outputs = self.model(images)
+                    loss = self.criterion(outputs, labels)
+
+                    # FedProx proximal term
+                    prox_term = 0.0
+                    for param, global_param in zip(self.model.parameters(), global_weights):
+                        prox_term += (self.mu / 2) * torch.norm(param - global_param) ** 2
+                    loss += prox_term
+
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.scheduler.step()
+
+                loss_total += loss.item() * labels.size(0)
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        train_loss = loss_total / total
+        train_accuracy = correct / total
+        print(f"{self.cid}-LOG: Completed local training - Loss: {train_loss:.4f} | Accuracy: {train_accuracy:.4f}")
+
+        return self.get_parameters(config), total, {
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy
+        }
 
 def build_client_talos_fn(
     use_iid: bool,
