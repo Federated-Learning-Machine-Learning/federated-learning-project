@@ -35,15 +35,12 @@ def non_iid_split(
     num_classes: int = 100
 ) -> List[Subset]:
     """
-    Split a dataset into non-IID subsets across clients, where each client receives samples from `nc` classes.
-
-    The fewer classes per client (`nc`), the more statistically heterogeneous the data becomes.
-    This simulates real-world non-IID conditions in Federated Learning.
+    Split a dataset into non-IID subsets across clients, allowing for sampling with replacement.
 
     Args:
         dataset (Dataset): The complete dataset to be split.
         num_clients (int): Number of clients to simulate.
-        nc (int): Number of distinct classes to assign to each client.
+        nc (int): Number of distinct classes to assign to each client (with replacement).
         num_classes (int): Total number of classes in the dataset (default: 100 for CIFAR-100).
 
     Returns:
@@ -57,30 +54,28 @@ def non_iid_split(
     for idx, (_, label) in enumerate(dataset):
         class_indices[label].append(idx)
 
-    # Step 2: Create shards per class
-    target_shard_size = len(dataset) // num_clients
+    # Step 2: Create shards per class (with replacement)
     shards_per_class = []
     for indices in class_indices:
-        if len(indices) >= target_shard_size:
-            num_shards = max(1, len(indices) // target_shard_size)
-            class_shards = list(np.array_split(indices, num_shards))
-        elif len(indices) > 0:
-            class_shards = [indices]  # Single shard if class has few samples
+        if len(indices) > 0:
+            # Randomly shuffle and allow for repeated sampling
+            shards = list(np.array_split(indices, max(1, len(indices) // num_clients)))
+            shards_per_class.append(shards)
         else:
-            class_shards = []
-        shards_per_class.append(class_shards)
+            shards_per_class.append([])
 
-    # Step 3: Assign Nc classes randomly to each client
+    # Step 3: Assign Nc classes (with replacement) to each client
     client_data_indices = [[] for _ in range(num_clients)]
-    class_pool = [cls for cls in range(num_classes) if shards_per_class[cls]]
+    available_classes = [cls for cls, shards in enumerate(shards_per_class) if shards]
 
     for client_id in range(num_clients):
-        chosen_classes = random.sample(class_pool, min(nc, len(class_pool)))
+        # Sample with replacement if needed
+        chosen_classes = random.choices(available_classes, k=nc)
+
         for cls in chosen_classes:
             if shards_per_class[cls]:
-                shard = shards_per_class[cls].pop()
-                if len(shard) > 0:
-                    client_data_indices[client_id].extend(shard)
+                shard = random.choice(shards_per_class[cls])
+                client_data_indices[client_id].extend(shard)
 
     # Step 4: Wrap in Subset and validate non-empty assignment
     client_subsets = []
