@@ -494,22 +494,23 @@ def build_client_talos_fn(
     local_epochs: int = 1,
 ) -> Callable[[Context], Client]:
 
-    def make_scheduler(optimizer: optim.Optimizer, scheduler_type: SchedulerType, scheduler_config: dict) -> optim.lr_scheduler._LRScheduler:
-        if scheduler_type == SchedulerType.COSINE:
+    def make_scheduler(optimizer: optim.Optimizer, scheduler_type: str, scheduler_config: dict) -> optim.lr_scheduler._LRScheduler:
+        scheduler_type = scheduler_type.lower()
+        if scheduler_type == "cosine":
             return optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.COSINE_RESTART:
+        elif scheduler_type == "cosine_restart":
             return optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.STEP:
+        elif scheduler_type == "step":
             return optim.lr_scheduler.StepLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.MULTISTEP:
+        elif scheduler_type == "multistep":
             return optim.lr_scheduler.MultiStepLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.EXPONENTIAL:
+        elif scheduler_type == "exponential":
             return optim.lr_scheduler.ExponentialLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.REDUCE_ON_PLATEAU:
+        elif scheduler_type == "reduce_on_plateau":
             return optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.CONSTANT:
+        elif scheduler_type == "constant":
             return optim.lr_scheduler.ConstantLR(optimizer, **scheduler_config)
-        elif scheduler_type == SchedulerType.LINEAR:
+        elif scheduler_type == "linear":
             return optim.lr_scheduler.LinearLR(optimizer, **scheduler_config)
         else:
             raise ValueError(f"Unsupported scheduler: {scheduler_type}")
@@ -566,7 +567,7 @@ class CIFARTaLoSClient(fl.client.NumPyClient):
         trainloader: torch.utils.data.DataLoader,
         valloader: torch.utils.data.DataLoader,
         device: torch.device,
-        scheduler_type: SchedulerType,
+        scheduler_type: str,
         scheduler_config: dict,
         optimizer_config: dict,
         talos_config: dict,
@@ -594,7 +595,7 @@ class CIFARTaLoSClient(fl.client.NumPyClient):
         print(f"{self.cid}-LOG: Starting TaLoS Mask Calibration")
         self.pruner.calibrate_masks(self.trainloader)
         
-        self.pruner.apply_masks()
+        #self.pruner.apply_masks()
 
         self.optimizer = SparseSGDM(
             params=self.model.head.parameters(),  # Use only head parameters
