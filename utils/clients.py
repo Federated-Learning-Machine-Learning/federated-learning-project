@@ -19,7 +19,7 @@ import numpy as np
 class ClientType(Enum):
     STANDARD = "standard"
     FEDPROX = "fedprox"
-    TALOS = "talos"
+    CIFARTaLoSClient = "talos"
 
 class OptimizerType(Enum):
     SSGD = "ssgd"
@@ -591,9 +591,11 @@ class CIFARTaLoSClient(fl.client.NumPyClient):
             num_batches=talos_config["num_batches"],
             rounds=talos_config["rounds"]
         )
+
+        mode = talos_config["calibration_mode"]
         
-        print(f"{self.cid}-LOG: Starting TaLoS Mask Calibration")
-        self.pruner.calibrate_masks(self.trainloader)
+        print(f"{self.cid}-LOG: Starting TaLoS Mask Calibration with mode: {mode}")
+        self.pruner.calibrate_masks(self.trainloader, mode)
         
         #self.pruner.apply_masks()
 
