@@ -19,7 +19,7 @@ import numpy as np
 class ClientType(Enum):
     STANDARD = "standard"
     FEDPROX = "fedprox"
-    CIFARTaLoSClient = "talos"
+    TALOS = "talos"
 
 class OptimizerType(Enum):
     SSGD = "ssgd"
