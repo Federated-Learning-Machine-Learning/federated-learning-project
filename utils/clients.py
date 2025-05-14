@@ -12,7 +12,7 @@ from enum import Enum
 from torch import device as torch_device
 from flwr.client import Client
 from torch.cuda.amp import GradScaler, autocast
-from editing import SparseSGDM, TaLoSPruner
+from editing import SparseSGDM, TaLoSPruner, SparseAdamW
 from torch.optim import Optimizer
 import numpy as np
 
@@ -23,6 +23,7 @@ class ClientType(Enum):
 
 class OptimizerType(Enum):
     SSGD = "ssgd"
+    SADAMW = "sadamw"
     SGD = "sgd"
     ADAM = "adam"
     ADAMW = "adamw"
@@ -481,8 +482,9 @@ class CIFARFederatedProxClient(CIFARFederatedClient):
 
 def build_client_talos_fn(
     use_iid: bool,
-    scheduler_type: SchedulerType,
+    optimizer_type: OptimizerType,
     optimizer_config: Dict,
+    scheduler_type: SchedulerType,
     scheduler_config: Dict,
     iid_partitions: List[Dataset],
     non_iid_partitions: List[Dataset],
@@ -543,6 +545,7 @@ def build_client_talos_fn(
             trainloader=trainloader,
             valloader=valloader,
             device=device,
+            optimizer_type=optimizer_type.value,
             optimizer_config=optimizer_config,
             scheduler_config=scheduler_config,
             scheduler_type=scheduler_type,
@@ -569,6 +572,7 @@ class CIFARTaLoSClient(fl.client.NumPyClient):
         device: torch.device,
         scheduler_type: str,
         scheduler_config: dict,
+        optimizer_type: str,
         optimizer_config: dict,
         talos_config: dict,
         scheduler_fn: Callable[[torch.optim.Optimizer], torch.optim.lr_scheduler._LRScheduler],
@@ -599,34 +603,63 @@ class CIFARTaLoSClient(fl.client.NumPyClient):
         self.pruner.calibrate_masks(self.trainloader, mode)
 
         if talos_config["mode"] == "head":
-            print("⚙️ Initializing SparseSGDM for Head Only")
-            self.optimizer = SparseSGDM(
-                params=self.model.head.parameters(),
-                lr=optimizer_config["lr"],
-                momentum=optimizer_config["momentum"],
-                weight_decay=optimizer_config["weight_decay"],
-                masks=self.pruner.masks
-            )
+            print(f"⚙️ Initializing {optimizer_type.upper()} for Head Only")
+
+            # === SparseSGDM for head ===
+            if optimizer_type == "ssgd":
+                self.optimizer = SparseSGDM(
+                    params=self.model.head.parameters(),
+                    lr=optimizer_config["lr"],
+                    momentum=optimizer_config["momentum"],
+                    weight_decay=optimizer_config["weight_decay"],
+                    masks=self.pruner.masks
+                )
+
+            # === SparseAdamW for head ===
+            elif optimizer_type == "sadamw":
+                self.optimizer = SparseAdamW(
+                    params=self.model.head.parameters(),
+                    lr=optimizer_config["lr"],
+                    betas=optimizer_config["betas"],
+                    eps=optimizer_config["eps"],
+                    weight_decay=optimizer_config["weight_decay"],
+                    masks=self.pruner.masks
+                )
+            else:
+                raise ValueError(f"Optimizer type '{optimizer_type}' is not supported.")
 
         elif talos_config["mode"] == "full":
-            print("⚙️ Initializing SparseSGDM for Full Model")
-            # Collect all parameters from all blocks, head, patch_embed, and norm
+            print(f"⚙️ Initializing {optimizer_type.upper()} for Full Model")
+            
             all_params = list(self.model.patch_embed.parameters()) + \
                         list(self.model.norm.parameters()) + \
                         list(self.model.head.parameters())
 
-            # Include all transformer blocks
             for block in self.model.blocks:
                 all_params.extend(list(block.parameters()))
 
-            # Initialize SparseSGDM with all parameters
-            self.optimizer = SparseSGDM(
-                params=all_params,
-                lr=optimizer_config["lr"],
-                momentum=optimizer_config["momentum"],
-                weight_decay=optimizer_config["weight_decay"],
-                masks=self.pruner.masks
-            )
+            # === SparseSGDM for full model ===
+            if optimizer_type == "ssgd":
+                self.optimizer = SparseSGDM(
+                    params=all_params,
+                    lr=optimizer_config["lr"],
+                    momentum=optimizer_config["momentum"],
+                    weight_decay=optimizer_config["weight_decay"],
+                    masks=self.pruner.masks
+                )
+
+            # === SparseAdamW for full model ===
+            elif optimizer_type == "sadamw":
+                self.optimizer = SparseAdamW(
+                    params=all_params,
+                    lr=optimizer_config["lr"],
+                    betas=optimizer_config["betas"],
+                    eps=optimizer_config["eps"],
+                    weight_decay=optimizer_config["weight_decay"],
+                    masks=self.pruner.masks
+                )
+            else:
+                raise ValueError(f"Optimizer type '{optimizer_type}' is not supported.")
 
         self.scheduler = scheduler_fn(self.optimizer, scheduler_type, scheduler_config)
         
