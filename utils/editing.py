@@ -5,6 +5,55 @@ from torch.cuda.amp import GradScaler, autocast
 from collections import defaultdict
 import numpy as np
 from torch.optim import SGD
+from torch.optim import AdamW
+
+class SparseAdamW(AdamW):
+    """
+    Sparse AdamW Optimizer.
+    This optimizer selectively updates only parameters specified by masks.
+
+    Args:
+        params (iterable): Model parameters to optimize.
+        lr (float): Learning rate.
+        betas (Tuple[float, float]): Coefficients used for computing running averages of gradient and its square.
+        eps (float): Term added to the denominator to improve numerical stability.
+        weight_decay (float): Weight decay (L2 penalty).
+        masks (dict): Dictionary of binary masks for parameter updates:
+            - ("layer_name", param): Mask Tensor
+    """
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, masks=None):
+        super().__init__(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        self.masks = masks
+        
+        # 📝 Generate a lookup dictionary for fast access
+        self.param_to_mask = {}
+        
+        print("🔍 Mapping parameters to their masks...")
+
+        # Create a fast lookup for parameters to their masks
+        for (layer_name, param), mask in self.masks.items():
+            self.param_to_mask[param] = mask
+        
+        print(f"✅ Mapped {len(self.param_to_mask)} parameters to masks.")
+
+    def step(self, closure=None):
+        """
+        Performs a single optimization step, applying the masks to the gradients
+        before updating the parameters.
+        """
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                # Apply mask if available
+                if p in self.param_to_mask:
+                    mask = self.param_to_mask[p]
+                    if mask is not None:
+                        p.grad.data.mul_(mask.to(p.grad.device))
+
+        # Proceed with the original AdamW step
+        super().step(closure)
 
 
 class SparseSGDM(SGD):
