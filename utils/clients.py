@@ -587,6 +587,7 @@ class CIFARTaLoSClient(fl.client.NumPyClient):
         self.pruner = TaLoSPruner(
             model=self.model,
             device=self.device,
+            mode=talos_config["mode"],
             final_sparsity=talos_config["final_sparsity"],
             num_batches=talos_config["num_batches"],
             rounds=talos_config["rounds"]
@@ -596,16 +597,37 @@ class CIFARTaLoSClient(fl.client.NumPyClient):
         
         print(f"{self.cid}-LOG: Starting TaLoS Mask Calibration with mode: {mode}")
         self.pruner.calibrate_masks(self.trainloader, mode)
-        
-        #self.pruner.apply_masks()
 
-        self.optimizer = SparseSGDM(
-            params=self.model.head.parameters(),  # Use only head parameters
-            lr=optimizer_config["lr"],
-            momentum=optimizer_config["momentum"],
-            weight_decay=optimizer_config["weight_decay"],
-            masks=self.pruner.masks
-        )
+        if talos_config["mode"] == "head":
+            print("⚙️ Initializing SparseSGDM for Head Only")
+            self.optimizer = SparseSGDM(
+                params=self.model.head.parameters(),
+                lr=optimizer_config["lr"],
+                momentum=optimizer_config["momentum"],
+                weight_decay=optimizer_config["weight_decay"],
+                masks=self.pruner.masks
+            )
+
+        elif talos_config["mode"] == "full":
+            print("⚙️ Initializing SparseSGDM for Full Model")
+            # Collect all parameters from all blocks, head, patch_embed, and norm
+            all_params = list(self.model.patch_embed.parameters()) + \
+                        list(self.model.norm.parameters()) + \
+                        list(self.model.head.parameters())
+
+            # Include all transformer blocks
+            for block in self.model.blocks:
+                all_params.extend(list(block.parameters()))
+
+            # Initialize SparseSGDM with all parameters
+            self.optimizer = SparseSGDM(
+                params=all_params,
+                lr=optimizer_config["lr"],
+                momentum=optimizer_config["momentum"],
+                weight_decay=optimizer_config["weight_decay"],
+                masks=self.pruner.masks
+            )
+
         self.scheduler = scheduler_fn(self.optimizer, scheduler_type, scheduler_config)
         
     def get_parameters(self, config):
