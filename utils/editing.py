@@ -17,11 +17,23 @@ class SparseSGDM(SGD):
         lr (float): Learning rate.
         momentum (float, optional): Momentum factor. Default: 0.
         weight_decay (float, optional): Weight decay (L2 penalty). Default: 0.
-        masks (list, optional): List of binary masks for parameter updates. Default: None.
+        masks (dict, optional): Dictionary of binary masks for parameter updates:
+            - ("layer_name", param): Mask Tensor
     """
     def __init__(self, params, lr, momentum=0, weight_decay=0, masks=None):
         super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
         self.masks = masks
+        
+        # 📝 Generate a lookup dictionary for fast access
+        self.param_to_mask = {}
+        
+        print("🔍 Mapping parameters to their masks...")
+
+        # Create a fast lookup for parameters to their masks
+        for (layer_name, param), mask in self.masks.items():
+            self.param_to_mask[param] = mask
+        
+        print(f"✅ Mapped {len(self.param_to_mask)} parameters to masks.")
 
     def step(self, closure=None):
         """
@@ -29,108 +41,169 @@ class SparseSGDM(SGD):
         before updating the parameters.
         """
         for group in self.param_groups:
-            for i, p in enumerate(group['params']):
+            for p in group['params']:
                 if p.grad is None:
                     continue
+                
                 # Apply mask if available
-                if self.masks is not None and self.masks[i] is not None:
-                    p.grad.data.mul_(self.masks[i].to(p.grad.device))
+                if p in self.param_to_mask:
+                    mask = self.param_to_mask[p]
+                    if mask is not None:
+                        p.grad.data.mul_(mask.to(p.grad.device))
+
         super().step(closure)
 
-        
 class TaLoSPruner:
-    def __init__(self, model, device, final_sparsity=0.9, num_batches=3, rounds=4):
-        self.model = model
-        self.device = device
-        self.final_sparsity = final_sparsity
-        self.num_batches = num_batches
-        self.rounds = rounds
-        self.masks = None
+    """
+    TaLoSPruner allows gradient masking and sparse fine-tuning on specific layers:
+    - The classifier head
+    - Specific Transformer blocks
+    """
 
-        # Identify the head of the model (DINO ViT for example)
-        if hasattr(model, 'head'):
-            print("🟢 Found model head. Pruning will be applied to the head only.")
-            self.head = model.head
-        else:
-            print("⚠️ No specific 'head' found. Applying pruning to the entire model.")
-            self.head = model
+    def __init__(self, model, device, mode="head", final_sparsity=0.9, num_batches=3, rounds=4):
+            """
+            Initialize the pruner for specified layers.
+
+            Args:
+                model (nn.Module): The vision transformer model.
+                device (torch.device): Device to perform pruning on.
+                mode (str): "head" to prune only the head, "full" to prune the entire model.
+                final_sparsity (float): Final desired sparsity.
+                num_batches (int): Number of batches to estimate Fisher Information.
+                rounds (int): Rounds of pruning calibration.
+            """
+            self.model = model
+            self.device = device
+            self.final_sparsity = final_sparsity
+            self.num_batches = num_batches
+            self.rounds = rounds
+            self.mode = mode.lower()
+            self.masks = {}
+
+            # 📝 Define the layers to prune based on the mode
+            if self.mode == "head":
+                print("🟢 Pruning will be applied to the classifier head only.")
+                self.head = model.head
+                self.layers_to_prune = [("head", model.head)]
+
+            elif self.mode == "full":
+                print("🟢 Pruning will be applied to the entire model.")
+                self.layers_to_prune = []
+                
+                # Include Patch Embedding
+                self.layers_to_prune.append(("patch_embed", model.patch_embed.proj))
+                
+                # Include Transformer Blocks
+                for idx, block in enumerate(model.blocks):
+                    self.layers_to_prune.append((f"block_{idx}_attn_qkv", block.attn.qkv))
+                    self.layers_to_prune.append((f"block_{idx}_attn_proj", block.attn.proj))
+                    self.layers_to_prune.append((f"block_{idx}_mlp_fc1", block.mlp.fc1))
+                    self.layers_to_prune.append((f"block_{idx}_mlp_fc2", block.mlp.fc2))
+                    self.layers_to_prune.append((f"block_{idx}_norm1", block.norm1))
+                    self.layers_to_prune.append((f"block_{idx}_norm2", block.norm2))
+                
+                # Include Final Layer Norm
+                self.layers_to_prune.append(("final_norm", model.norm))
+                
+                # Include Classifier Head
+                self.layers_to_prune.append(("head", model.head))
+            else:
+                raise ValueError(f"Unknown mode '{mode}'. Use 'head' or 'full'.")
 
     def fisher_information(self, dataloader):
+            """
+            Computes the Fisher Information matrix for parameter sensitivity estimation.
+            """
+            fisher_scores = {}
+
+            # Initialize Fisher scores for each layer
+            for name, layer in self.layers_to_prune:
+                for p in layer.parameters():
+                    fisher_scores[(name, p)] = torch.zeros_like(p, device=self.device)
+
+            print(f"📝 Calculating Fisher Information on {self.num_batches} batches...")
+
+            self.model.train()
+
+            for batch_idx, (inputs, targets) in enumerate(dataloader):
+                if batch_idx >= self.num_batches:
+                    break
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                self.model.zero_grad()
+
+                # Forward pass through the model
+                with autocast():
+                    outputs = self.model(inputs)
+                    loss = nn.CrossEntropyLoss()(outputs, targets)
+
+                # Backward pass
+                loss.backward()
+
+                # Accumulate the Fisher Information scores
+                for (name, layer) in self.layers_to_prune:
+                    for p in layer.parameters():
+                        if p.grad is not None:
+                            fisher_scores[(name, p)] += (p.grad.data ** 2) * inputs.size(0)
+
+            # Normalize the scores
+            for key in fisher_scores:
+                fisher_scores[key] /= self.num_batches
+
+            print("✅ Fisher Information Computation Completed.")
+            return fisher_scores
+
+    def _generate_masks(self, all_scores, strategy):
         """
-        Computes the Fisher Information matrix for parameter sensitivity estimation.
-        Only parameters in the `head` are considered.
+        Helper method to generate binary masks based on sensitivity scores.
         """
-        fisher_scores = {p: torch.zeros_like(p, device=self.device) for p in self.head.parameters()}
-        self.model.train()
+        masks = {}
+        for (layer_name, param), score in all_scores:
+            if strategy == "least_sensitive":
+                threshold = torch.quantile(score, 1 - self.final_sparsity)
+                mask = (score <= threshold).float().reshape(param.shape).to(self.device)
+            elif strategy == "most_sensitive":
+                threshold = torch.quantile(score, self.final_sparsity)
+                mask = (score >= threshold).float().reshape(param.shape).to(self.device)
+            else:
+                raise ValueError(f"Unknown strategy: {strategy}")
+            
+            masks[(layer_name, param)] = mask
+        return masks
 
-        for batch_idx, (inputs, targets) in enumerate(dataloader):
-            if batch_idx >= self.num_batches:
-                break
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            self.model.zero_grad()
-
-            # Forward pass through the head
-            with autocast():
-                outputs = self.model(inputs)
-                loss = nn.CrossEntropyLoss()(outputs, targets)
-
-            loss.backward()
-
-            # Accumulate the Fisher Information scores
-            for p in self.head.parameters():
-                if p.grad is not None:
-                    fisher_scores[p] += (p.grad.data ** 2) * inputs.size(0)
-
-        # Normalize the scores
-        for p in fisher_scores:
-            fisher_scores[p] /= self.num_batches
-
-        return fisher_scores
-
+        
     def calibrate_masks(self, dataloader, strategy="least_sensitive"):
         """
         Multi-round mask calibration to refine parameter selection.
-        Only parameters in the `head` are considered for pruning.
+        Pruning is applied to:
+        - The classifier head if mode is "head"
+        - The entire model if mode is "full"
+
+        Args:
+            dataloader: DataLoader object for sampling batches.
+            strategy (str): Strategy for pruning, either "least_sensitive" or "most_sensitive".
         """
-        print(f"🔎 Starting multi-round calibration for the model head only.")
+        print(f"🔎 Starting multi-round calibration for mode '{self.mode}'.")
+        
         for round_num in range(self.rounds):
             print(f"🌀 Calibration Round {round_num + 1}/{self.rounds}")
+            
+            # Step 1: Compute Fisher Information for all components
             fisher_scores = self.fisher_information(dataloader)
 
-            # Flatten and sort by sensitivity
-            all_scores = []
-            for param, score in fisher_scores.items():
-                all_scores.append((score.flatten(), param))
+            # Step 2: Flatten and sort by sensitivity
+            def _flatten_and_sort(fisher_scores):
+                """
+                Helper to flatten and sort Fisher scores
+                """
+                all_scores = []
+                for (layer_name, param), score in fisher_scores.items():
+                    all_scores.append(((layer_name, param), score.flatten()))
+                all_scores.sort(key=lambda x: x[1].mean(), reverse=True)
+                return all_scores
 
-            all_scores.sort(key=lambda x: x[0].mean(), reverse=True)
+            # Step 3: Generate Masks
+            all_scores = _flatten_and_sort(fisher_scores)
+            self.masks = self._generate_masks(all_scores, strategy)
 
-            # Update sparsity for this round
-            current_sparsity = self.final_sparsity * (round_num + 1) / self.rounds
-            total_params = sum(p.numel() for p in self.head.parameters())
-            num_keep = int((1 - current_sparsity) * total_params)
+        print("✅ Mask Calibration Completed!")
 
-            # Generate masks
-            self.masks = []
-            strategy = strategy.lower()
-            if strategy == "least_sensitive":
-                for score, param in all_scores:
-                    threshold = torch.quantile(score, 1 - current_sparsity) 
-                    mask = (score <= threshold).float().reshape(param.shape).to(self.device) #keeps weights with score lower than threshold
-                    self.masks.append(mask)
-            if strategy == "most_sensitive":
-                for score, param in all_scores:
-                    threshold = torch.quantile(score, current_sparsity)
-                    mask = (score >= threshold).float().reshape(param.shape).to(self.device)
-                    self.masks.append(mask)
-
-            # Apply the new masks
-            #self.apply_masks()
-            print(f"✅ Mask updated with {current_sparsity * 100:.2f}% sparsity")
-
-    """def apply_masks(self):
-        
-        #Apply the binary masks to the head parameters only.
-        
-        with torch.no_grad():
-            for mask, param in zip(self.masks, self.head.parameters()):
-                param.data *= mask"""
