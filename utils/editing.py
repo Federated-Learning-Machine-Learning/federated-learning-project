@@ -109,7 +109,8 @@ class TaLoSPruner:
     - Specific Transformer blocks
     """
 
-    def __init__(self, model, device, mode="head", final_sparsity=0.9, num_batches=3, rounds=4):
+    def __init__(self, model, device, mode="head",
+     final_sparsity=0.9, num_batches=3, rounds=4, layers_to_prune=None):
             """
             Initialize the pruner for specified layers.
 
@@ -120,6 +121,7 @@ class TaLoSPruner:
                 final_sparsity (float): Final desired sparsity.
                 num_batches (int): Number of batches to estimate Fisher Information.
                 rounds (int): Rounds of pruning calibration.
+                layers_to_prune (list): List of layer names to prune (for PFedEdit).
             """
             self.model = model
             self.device = device
@@ -156,6 +158,9 @@ class TaLoSPruner:
                 
                 # Include Classifier Head
                 self.layers_to_prune.append(("head", model.head))
+            elif self.mode == "pfededit":
+                print(f"🟢 Pruning will be applied to the following layers: {layers_to_prune}")
+                self.layers_to_prune = [(f"block_{i}", self.model.blocks[i]) for i in layers_to_prune]
             else:
                 raise ValueError(f"Unknown mode '{mode}'. Use 'head' or 'full'.")
 
@@ -255,4 +260,3 @@ class TaLoSPruner:
             self.masks = self._generate_masks(all_scores, strategy)
 
         print("✅ Mask Calibration Completed!")
-
