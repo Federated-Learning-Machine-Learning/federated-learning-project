@@ -102,6 +102,7 @@ class FedYogiStandard(FedYogi):
         """
         super().__init__(**kwargs)
         self.logger = logger
+        
 
     def aggregate_fit(
         self,

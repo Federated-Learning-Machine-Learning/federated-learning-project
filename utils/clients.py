@@ -22,6 +22,8 @@ class ClientType(Enum):
     FEDPROX = "fedprox"
     TALOS = "talos"
     TALOSPROX = "talosprox"
+    PFEDEDIT = "pfededit"
+    PFEDEDITPROX = "pfededitprox"
 
 class OptimizerType(Enum):
     SSGD = "ssgd"
@@ -994,3 +996,278 @@ class CIFARTaLoSProxClient(CIFARTaLoSClient):
               "train_loss": train_loss,
               "train_accuracy": train_accuracy
           }
+
+
+def build_client_fn_pfededit(
+    use_iid: bool,
+    optimizer_type: OptimizerType,
+    optimizer_config: Dict,
+    scheduler_type: SchedulerType,
+    scheduler_config: Dict,
+    iid_partitions: List[Dataset],
+    non_iid_partitions: List[Dataset],
+    model_fn: Callable[[], nn.Module],
+    device: torch_device,
+    valset: Dataset,
+    batch_size: int,
+    local_epochs: int = 1,
+    top_k_layers: int = 2,
+    stochastic_factor: float = 0.5,
+    max_batches: int = 4
+) -> Callable[[Context], Client]:
+    """
+    Build a client function for PFedEdit.
+    """
+
+    def make_optimizer(params: List[nn.Parameter], optimizer_type: str, optimizer_config: dict) -> optim.Optimizer:
+        if optimizer_type == OptimizerType.SGD:
+            return optim.SGD(params, **optimizer_config)
+        elif optimizer_type == OptimizerType.ADAM:
+            return optim.Adam(params, **optimizer_config)
+        elif optimizer_type == OptimizerType.ADAMW:
+            return optim.AdamW(params, **optimizer_config)
+        elif optimizer_type == OptimizerType.RMSPROP:
+            return optim.RMSprop(params, **optimizer_config)
+        elif optimizer_type == OptimizerType.ADAGRAD:
+            return optim.Adagrad(params, **optimizer_config)
+        else:
+            raise ValueError(f"Optimizer type {optimizer_type} not supported.")
+
+
+    def make_scheduler(optimizer: optim.Optimizer, scheduler_type: str, scheduler_config: dict) -> optim.lr_scheduler._LRScheduler:
+        if scheduler_type == SchedulerType.COSINE:
+            return optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.COSINE_RESTART:
+            return optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.STEP:
+            return optim.lr_scheduler.StepLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.MULTISTEP:
+            return optim.lr_scheduler.MultiStepLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.EXPONENTIAL:
+            return optim.lr_scheduler.ExponentialLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.REDUCE_ON_PLATEAU:
+            return optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.CONSTANT:
+            return optim.lr_scheduler.ConstantLR(optimizer, **scheduler_config)
+        elif scheduler_type == SchedulerType.LINEAR:
+            return optim.lr_scheduler.LinearLR(optimizer, **scheduler_config)
+        
+        
+    def client_fn(context: Context) -> Client:
+        """
+        Construct a client instance based on the context provided by Flower.
+        """
+        cid = int(context.node_config["partition-id"])
+        print(f"LOG: Initializing client with CID={cid}")
+        
+        trainset = iid_partitions[cid] if use_iid else non_iid_partitions[cid]
+        print(f"{cid}-LOG: Data partition assigned to client {cid} -> {'IID' if use_iid else 'Non-IID'}")
+
+        model = model_fn()
+        print(f"{cid}-LOG: Model initialized for client {cid}")
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+        valloader = DataLoader(valset, batch_size=batch_size)
+        print(f"{cid}-LOG: Dataloaders initialized for client {cid}")
+
+        # Create a NumPyClient instance
+        return PFedEditClient(
+            cid=cid,
+            model=model,
+            trainloader=trainloader,
+            valloader=valloader,
+            device=device,
+            optimizer_config=optimizer_config,
+            optimizer_type=optimizer_type,
+            scheduler_config=scheduler_config,
+            scheduler_type=scheduler_type,
+            optimizer_fn=make_optimizer,
+            scheduler_fn=make_scheduler,
+            local_epochs=local_epochs,
+            top_k_layers=top_k_layers,
+            stochastic_factor=stochastic_factor,
+            max_batches=max_batches
+        ).to_client()
+        
+        print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
+    
+    return client_fn
+    
+
+class PFedEditClient(fl.client.NumPyClient):
+    def __init__(
+        self,
+        cid: int,
+        model: nn.Module,
+        trainloader: DataLoader,
+        valloader: DataLoader,
+        device: torch.device,
+        optimizer_config: Dict,
+        optimizer_type: str,
+        scheduler_config: Dict,
+        scheduler_type: str,
+        optimizer_fn,
+        scheduler_fn,
+        local_epochs: int = 1,
+        top_k_layers: int = 2,
+        stochastic_factor: float = 0.5,
+        max_batches: int = 4
+    ):
+        self.cid = cid
+        self.model = model.to(device)
+        self.trainloader = trainloader
+        self.valloader = valloader
+        self.device = device
+        self.optimizer_config = optimizer_config
+        self.optimizer_type = optimizer_type
+        self.scheduler_config = scheduler_config
+        self.scheduler_type = scheduler_type
+        self.optimizer_fn = optimizer_fn
+        self.scheduler_fn = scheduler_fn
+        self.local_epochs = local_epochs
+        self.top_k_layers = top_k_layers
+        self.stochastic_factor = stochastic_factor
+        self.max_batches = max_batches
+    
+    def get_parameters(self, config):
+        """
+        Extract model parameters for sending to the server.
+
+        Args:
+            config (dict): Not used (placeholder).
+
+        Returns:
+            List[np.ndarray]: List of NumPy arrays representing model parameters.
+        """
+        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+
+
+    def set_parameters(self, parameters):
+        """Set the local model parameters."""
+        params_dict = zip(self.model.state_dict().keys(), parameters)
+        state_dict = {k: torch.tensor(v) for k, v in params_dict}
+        self.model.load_state_dict(state_dict, strict=True)
+    
+
+    def fit(self, parameters, config):
+        """Train the model using the provided parameters."""
+        self.set_parameters(parameters)
+        self.model.train()
+
+        params_to_train = self.select_params_to_train()
+        optimizer = self.optimizer_fn(params_to_train, self.optimizer_type, self.optimizer_config)
+        scheduler = self.scheduler_fn(optimizer, self.scheduler_type, self.scheduler_config)
+
+        total = 0
+        correct = 0
+        loss_total = 0.0
+
+        for epoch in range(self.local_epochs):
+            for images, labels in self.trainloader:
+                images, labels = images.to(self.device), labels.to(self.device)
+
+                optimizer.zero_grad()
+                output = self.model(images)
+                loss = nn.CrossEntropyLoss()(output, labels)
+                loss.backward()
+                optimizer.step()
+
+                loss_total += loss.item() * images.size(0)  # somma pesata per batch size
+                _, predicted = torch.max(output.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+            scheduler.step()
+
+        train_loss = loss_total / total
+        train_accuracy = correct / total
+        print(f"{self.cid}-LOG: Completed local training - Loss: {train_loss:.4f} | Accuracy: {train_accuracy:.4f}")
+
+        return self.get_parameters({}), len(self.trainloader.dataset), {
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy
+        }
+
+
+    def evaluate(self, parameters, config):
+        """Evaluate the model using the provided parameters."""
+        self.set_parameters(parameters)
+        self.model.eval()
+
+        loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for images, labels in self.valloader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                outputs = self.model(images)
+                loss += nn.CrossEntropyLoss()(outputs, labels).item() * images.size(0)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        print(f"{self.cid}-LOG: Evaluation completed - Evaluation Loss: {loss / total:.4f} | Evaluation Accuracy: {correct / total:.4f}")
+        return loss / total, total, {"val_accuracy": correct / total}
+
+    def select_params_to_train(self):
+        """Select which parameters to train based on the PFedEdit strategy."""
+        sample = random.random()
+
+        if sample < self.stochastic_factor:
+            print(f"{self.cid}-LOG: Stochastic Sampling Activated, Full Model Training")
+            all_params = list(self.model.parameters())
+        else:
+            print(f"{self.cid}-LOG: PFedEdit Local Layer Selection")
+            candidate_layers = list(range(len(self.model.blocks)))
+            loss_values = self._evaluate_layer_loss(candidate_layers, max_batches=self.max_batches)
+            top_layers = sorted(loss_values, key=loss_values.get)[:self.top_k_layers]
+            print(f"{self.cid}-LOG: Selected Layers (Min Loss): {top_layers}")
+            all_params = []
+            for idx in top_layers:
+                all_params += list(self.model.blocks[idx].parameters())
+
+            # Optional: include head and norm layers
+            all_params += list(self.model.head.parameters())
+            all_params += list(self.model.norm.parameters())
+
+        return all_params
+
+    def _evaluate_layer_loss(self, candidate_layers, max_batches=4):
+        """Evaluate the loss for each layer."""
+        loss_values = {}
+        criterion = nn.CrossEntropyLoss()
+        self.model.eval()
+
+        print("Max Batches:", max_batches)
+
+        with torch.no_grad():
+            for idx in candidate_layers:
+                layer_loss = 0.0
+                batch_count = 0
+                for images, labels in self.trainloader:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    output = self._forward_with_mask(idx, images)
+                    layer_loss += criterion(output, labels).item()
+                    batch_count += 1
+                    if batch_count >= max_batches:
+                        break
+                if batch_count == 0:
+                    loss_values[idx] = float("inf")
+                else:
+                    loss_values[idx] = layer_loss / batch_count
+
+        return loss_values
+
+
+    def _forward_with_mask(self, active_layer_idx: int, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with only the active layer enabled."""
+        x = self.model.patch_embed(x)
+        for i, blk in enumerate(self.model.blocks):
+            if i == active_layer_idx:
+                x = blk(x)
+            else:
+                with torch.no_grad():
+                    x = blk(x)
+        x = self.model.norm(x)
+        x = self.model.head(x[:, 0])
+        return x
