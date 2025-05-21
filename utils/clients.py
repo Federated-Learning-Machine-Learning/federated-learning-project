@@ -1012,7 +1012,6 @@ def build_client_fn_pfededit(
     batch_size: int,
     local_epochs: int = 1,
     top_k_layers: int = 2,
-    stochastic_factor: float = 0.5,
     max_batches: int = 4
 ) -> Callable[[Context], Client]:
     """
@@ -1084,7 +1083,6 @@ def build_client_fn_pfededit(
             scheduler_fn=make_scheduler,
             local_epochs=local_epochs,
             top_k_layers=top_k_layers,
-            stochastic_factor=stochastic_factor,
             max_batches=max_batches
         ).to_client()
         
@@ -1109,7 +1107,6 @@ class PFedEditClient(fl.client.NumPyClient):
         scheduler_fn,
         local_epochs: int = 1,
         top_k_layers: int = 2,
-        stochastic_factor: float = 0.5,
         max_batches: int = 4
     ):
         self.cid = cid
@@ -1125,7 +1122,7 @@ class PFedEditClient(fl.client.NumPyClient):
         self.scheduler_fn = scheduler_fn
         self.local_epochs = local_epochs
         self.top_k_layers = top_k_layers
-        self.stochastic_factor = stochastic_factor
+        self.stochastic_factor = 1.0
         self.max_batches = max_batches
     
     def get_parameters(self, config):
@@ -1152,14 +1149,28 @@ class PFedEditClient(fl.client.NumPyClient):
         """Train the model using the provided parameters."""
         self.set_parameters(parameters)
         self.model.train()
+        # Retrieve current rouuf nd and total rounds from config
+        current_round = config.get("current_round", 0)
+        total_rounds = config.get("total_rounds", 100)  # fallback
+        print("Current Round:", current_round)
+        print("Total Rounds:", total_rounds)
 
-        params_to_train = self.select_params_to_train()
+        initial_stochastic = 1.0
+        progress = (current_round - 1) / max(total_rounds - 1, 1)
+        current_stochastic = initial_stochastic * (1.0 - progress)
+        current_stochastic = max(current_stochastic, 0.0)
+
+        print(f"{self.cid}-LOG: Round {current_round} | Dynamic Stochastic Factor: {current_stochastic:.4f}")
+
+        params_to_train = self.select_params_to_train(current_stochastic)
+
         optimizer = self.optimizer_fn(params_to_train, self.optimizer_type, self.optimizer_config)
         scheduler = self.scheduler_fn(optimizer, self.scheduler_type, self.scheduler_config)
 
-        total = 0
-        correct = 0
+
         loss_total = 0.0
+        correct = 0
+        total = 0
 
         for epoch in range(self.local_epochs):
             for images, labels in self.trainloader:
@@ -1209,15 +1220,15 @@ class PFedEditClient(fl.client.NumPyClient):
         print(f"{self.cid}-LOG: Evaluation completed - Evaluation Loss: {loss / total:.4f} | Evaluation Accuracy: {correct / total:.4f}")
         return loss / total, total, {"val_accuracy": correct / total}
 
-    def select_params_to_train(self):
+    def select_params_to_train(self, stochastic_factor: float):
         """Select which parameters to train based on the PFedEdit strategy."""
         sample = random.random()
 
-        if sample < self.stochastic_factor:
-            print(f"{self.cid}-LOG: Stochastic Sampling Activated, Full Model Training")
+        if sample < stochastic_factor:
+            print(f"{self.cid}-LOG: Stochastic Sampling Activated (stochastic_factor={stochastic_factor:.4f}), Full Model Training")
             all_params = list(self.model.parameters())
         else:
-            print(f"{self.cid}-LOG: PFedEdit Local Layer Selection")
+            print(f"{self.cid}-LOG: PFedEdit Local Layer Selection (stochastic_factor={stochastic_factor:.4f})")
             candidate_layers = list(range(len(self.model.blocks)))
             loss_values = self._evaluate_layer_loss(candidate_layers, max_batches=self.max_batches)
             top_layers = sorted(loss_values, key=loss_values.get)[:self.top_k_layers]
@@ -1225,8 +1236,6 @@ class PFedEditClient(fl.client.NumPyClient):
             all_params = []
             for idx in top_layers:
                 all_params += list(self.model.blocks[idx].parameters())
-
-            # Optional: include head and norm layers
             all_params += list(self.model.head.parameters())
             all_params += list(self.model.norm.parameters())
 
@@ -1271,3 +1280,175 @@ class PFedEditClient(fl.client.NumPyClient):
         x = self.model.norm(x)
         x = self.model.head(x[:, 0])
         return x
+    
+
+def build_client_fn_pfededitprox(
+    use_iid: bool,
+    optimizer_type: OptimizerType,
+    optimizer_config: Dict,
+    scheduler_type: SchedulerType,
+    scheduler_config: Dict,
+    iid_partitions: List[Dataset],
+    non_iid_partitions: List[Dataset],
+    model_fn: Callable[[], nn.Module],
+    device: torch_device,
+    valset: Dataset,
+    batch_size: int,
+    talos_config: dict,
+    local_epochs: int = 1,
+    mu: float = 0.1
+) -> Callable[[Context], Client]:
+
+    """
+    Build a client function for PFedEdit with FedProx.
+    """
+
+    def make_scheduler(optimizer: optim.Optimizer, scheduler_type: str, scheduler_config: dict) -> optim.lr_scheduler._LRScheduler:
+        if scheduler_type == "cosine":
+            return optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_config)
+        elif scheduler_type == "cosine_restart":
+            return optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **scheduler_config)
+        elif scheduler_type == "step":
+            return optim.lr_scheduler.StepLR(optimizer, **scheduler_config)
+        elif scheduler_type == "multistep":
+            return optim.lr_scheduler.MultiStepLR(optimizer, **scheduler_config)
+        elif scheduler_type == "exponential":
+            return optim.lr_scheduler.ExponentialLR(optimizer, **scheduler_config)
+        elif scheduler_type == "reduce_on_plateau":
+            return optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_config)
+        elif scheduler_type == "constant":
+            return optim.lr_scheduler.ConstantLR(optimizer, **scheduler_config)
+        elif scheduler_type == "linear":
+            return optim.lr_scheduler.LinearLR(optimizer, **scheduler_config)
+        else:
+            raise ValueError(f"Unsupported scheduler: {scheduler_type}")
+    
+    def client_fn(context: Context) -> Client:
+        """
+        Construct a client instance based on the context provided by Flower.
+        """
+        cid = int(context.node_config["partition-id"])
+        print(f"LOG: Initializing client with CID={cid}")
+        
+        trainset = iid_partitions[cid] if use_iid else non_iid_partitions[cid]
+        print(f"{cid}-LOG: Data partition assigned to client {cid} -> {'IID' if use_iid else 'Non-IID'}")
+
+        model = model_fn()
+        print(f"{cid}-LOG: Model initialized for client {cid}")
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+        valloader = DataLoader(valset, batch_size=batch_size)
+        print(f"{cid}-LOG: Dataloaders initialized for client {cid}")
+
+        # Create a NumPyClient instance
+        return PFedEditProxClient(
+            cid=cid,
+            model=model,
+            trainloader=trainloader,
+            valloader=valloader,
+            device=device,
+            optimizer_type=optimizer_type.value,
+            optimizer_config=optimizer_config,
+            scheduler_config=scheduler_config,
+            scheduler_type=scheduler_type,
+            scheduler_fn=make_scheduler,
+            local_epochs=local_epochs,
+            talos_config=talos_config,
+            mu=mu
+        ).to_client()
+    
+
+        print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
+
+class PFedEditProxClient(PFedEditClient):
+    """
+    A Federated Learning client that uses PFedEdit with FedProx during local updates.
+    """
+
+    def __init__(
+        self,
+        cid: int,
+        model: nn.Module,
+        trainloader: DataLoader,
+        valloader: DataLoader,
+        device: torch.device,
+        optimizer_config: Dict,
+        optimizer_type: str,
+        scheduler_config: Dict,
+        scheduler_type: str,
+        optimizer_fn,
+        scheduler_fn,
+        local_epochs: int = 1,
+        mu: float = 0.1
+    ):
+        super().__init__(
+            cid=cid,
+            model=model,
+            trainloader=trainloader,
+            valloader=valloader,
+            device=device,
+            optimizer_config=optimizer_config,
+            optimizer_type=optimizer_type,
+            scheduler_config=scheduler_config,
+            scheduler_type=scheduler_type,
+            optimizer_fn=optimizer_fn,
+            scheduler_fn=scheduler_fn,
+            local_epochs=local_epochs
+        )
+        self.mu = mu
+        print(f"{self.cid}-LOG: Initialized with FedProx μ = {self.mu}")
+    
+    def fit(self, parameters, config):
+        """
+        Train the local model with PFedEdit and FedProx for one round.
+        """
+        self.set_parameters(parameters)
+        self.model.train()
+        correct, total, loss_total = 0, 0, 0.0
+
+        # Retrieve current round and total rounds from config
+        current_round = config.get("current_round", 0)
+        total_rounds = config.get("total_rounds", 100)
+        print("Current Round:", current_round)
+        print("Total Rounds:", total_rounds)
+        initial_stochastic = 1.0
+        progress = (current_round - 1) / max(total_rounds - 1, 1)
+        current_stochastic = initial_stochastic * (1.0 - progress)
+        current_stochastic = max(current_stochastic, 0.0)
+        print(f"{self.cid}-LOG: Round {current_round} | Dynamic Stochastic Factor: {current_stochastic:.4f}")
+        params_to_train = self.select_params_to_train(current_stochastic)
+        optimizer = self.optimizer_fn(params_to_train, self.optimizer_type, self.optimizer_config)
+        scheduler = self.scheduler_fn(optimizer, self.scheduler_type, self.scheduler_config)
+        loss_total = 0.0
+        correct = 0
+        total = 0
+        global_weights = {name: p.clone().detach() for name, p in self.model.named_parameters()}
+        for epoch in range(self.local_epochs):
+            print(f"{self.cid}-LOG: Starting epoch {epoch + 1}/{self.local_epochs}")
+            for images, labels in self.trainloader:
+                images, labels = images.to(self.device), labels.to(self.device)
+
+                optimizer.zero_grad()
+                output = self.model(images)
+                loss = nn.CrossEntropyLoss()(output, labels)
+
+                # FedProx proximal term
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and name in global_weights:
+                        prox_term = self.mu * 0.5 * torch.norm(param - global_weights[name]) ** 2
+                        loss += prox_term
+
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                loss_total += loss.item() * images.size(0)
+                _, predicted = torch.max(output.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        train_loss = loss_total / total
+        train_accuracy = correct / total
+        print(f"{self.cid}-LOG: Completed local training - Loss: {train_loss:.4f} | Accuracy: {train_accuracy:.4f}")
+        return self.get_parameters(config), len(self.trainloader.dataset), {
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy
+        }
