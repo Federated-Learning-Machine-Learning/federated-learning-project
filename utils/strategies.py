@@ -21,7 +21,7 @@ class FedAvgStandard(FedAvg):
     - Global and per-client validation loss and accuracy
     """
 
-    def __init__(self, logger: FederatedWandBLogger, **kwargs):
+    def __init__(self, logger: FederatedWandBLogger, num_rounds = 8, **kwargs):
         """
         Initialize the strategy with a WandB Logger.
 
@@ -31,8 +31,24 @@ class FedAvgStandard(FedAvg):
         """
         super().__init__(**kwargs)
         self.logger = logger
+        self.num_rounds = num_rounds
+    
+    def configure_fit(self, server_round, parameters, client_manager):
+         # Ottieni la configurazione base dal metodo padre
+        config_dicts = super().configure_fit(server_round, parameters, client_manager)
 
-    def aggregate_fit(self, rnd, results, failures):
+        # Aggiungi current_round e total_rounds alla config di ciascun client
+        updated_config_dicts = []
+        for client_config in config_dicts:
+            # client_config è una tupla (ClientProxy, FitIns)
+            client, fit_ins = client_config
+            fit_ins.config["current_round"] = server_round
+            fit_ins.config["total_rounds"] = self.num_rounds if hasattr(self, "num_rounds") else -1
+            updated_config_dicts.append((client, fit_ins))
+
+        return updated_config_dicts
+
+    def aggregate_fit(self, server_round, results, failures):
         """
         Aggregate training results from clients and log metrics to WandB.
 
@@ -48,19 +64,19 @@ class FedAvgStandard(FedAvg):
         for client_id, fit_res in enumerate(results):
             metrics = fit_res[1].metrics
             if metrics:
-                self.logger.log_client_metrics(client_id, metrics, round_number=rnd)
+                self.logger.log_client_metrics(client_id, metrics, round_number=server_round)
 
         # Perform aggregation
-        aggregated_parameters, aggregated_metrics = super().aggregate_fit(rnd, results, failures)
+        aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
 
         # Log aggregated global training metrics
         if aggregated_metrics:
-            self.logger.log_global_metrics(aggregated_metrics, round_number=rnd)
+            self.logger.log_global_metrics(aggregated_metrics, round_number=server_round)
 
         self.latest_parameters = aggregated_parameters
         return aggregated_parameters, aggregated_metrics
 
-    def aggregate_evaluate(self, rnd, results, failures):
+    def aggregate_evaluate(self, server_round, results, failures):
         """
         Aggregate evaluation results from clients and log metrics to WandB.
 
@@ -73,13 +89,13 @@ class FedAvgStandard(FedAvg):
             Tuple: Aggregated evaluation loss and metrics.
         """
         # Perform aggregation
-        aggregated_loss, aggregated_metrics = super().aggregate_evaluate(rnd, results, failures)
+        aggregated_loss, aggregated_metrics = super().aggregate_evaluate(server_round, results, failures)
 
         # Log global evaluation metrics
         if aggregated_loss is not None:
-            self.logger.log_global_metrics({"eval_loss": aggregated_loss}, round_number=rnd)
+            self.logger.log_global_metrics({"eval_loss": aggregated_loss}, round_number=server_round)
         if aggregated_metrics and "accuracy" in aggregated_metrics:
-            self.logger.log_global_metrics(aggregated_metrics, round_number=rnd)
+            self.logger.log_global_metrics(aggregated_metrics, round_number=server_round)
 
         return aggregated_loss, aggregated_metrics
 
@@ -92,7 +108,7 @@ class FedYogiStandard(FedYogi):
     - Global and per-client validation loss and accuracy
     """
 
-    def __init__(self, logger: FederatedWandBLogger, **kwargs):
+    def __init__(self, logger: FederatedWandBLogger, num_rounds = 8, **kwargs):
         """
         Initialize the strategy with a WandB Logger.
 
@@ -102,6 +118,22 @@ class FedYogiStandard(FedYogi):
         """
         super().__init__(**kwargs)
         self.logger = logger
+        self.num_rounds = num_rounds
+    
+    def configure_fit(self, server_round, parameters, client_manager):
+            # Ottieni la configurazione base dal metodo padre
+            config_dicts = super().configure_fit(server_round, parameters, client_manager)
+    
+            # Aggiungi current_round e total_rounds alla config di ciascun client
+            updated_config_dicts = []
+            for client_config in config_dicts:
+                # client_config è una tupla (ClientProxy, FitIns)
+                client, fit_ins = client_config
+                fit_ins.config["current_round"] = server_round
+                fit_ins.config["total_rounds"] = self.num_rounds if hasattr(self, "num_rounds") else -1
+                updated_config_dicts.append((client, fit_ins))
+    
+            return updated_config_dicts
         
 
     def aggregate_fit(
