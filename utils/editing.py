@@ -123,7 +123,7 @@ class TaLoSPruner:
                 rounds (int): Rounds of pruning calibration.
                 layers_to_prune (list): List of layer names to prune (for PFedEdit).
             """
-            self.model = model
+            self.model = model.to(device)
             self.device = device
             self.final_sparsity = final_sparsity
             self.num_batches = num_batches
@@ -186,9 +186,9 @@ class TaLoSPruner:
                 self.model.zero_grad()
 
                 # Forward pass through the model
-                with autocast():
-                    outputs = self.model(inputs)
-                    loss = nn.CrossEntropyLoss()(outputs, targets)
+                inputs = inputs.to(self.device).float()
+                outputs = self.model(inputs)
+                loss = nn.CrossEntropyLoss()(outputs, targets)
 
                 # Backward pass
                 loss.backward()

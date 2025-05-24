@@ -24,6 +24,7 @@ class ClientType(Enum):
     TALOSPROX = "talosprox"
     PFEDEDIT = "pfededit"
     PFEDEDITPROX = "pfededitprox"
+    TALOSPFEDEDIT = "talospfededit"
 
 class OptimizerType(Enum):
     SSGD = "ssgd"
@@ -1141,8 +1142,9 @@ class PFedEditClient(fl.client.NumPyClient):
     def set_parameters(self, parameters):
         """Set the local model parameters."""
         params_dict = zip(self.model.state_dict().keys(), parameters)
-        state_dict = {k: torch.tensor(v) for k, v in params_dict}
+        state_dict = {k: torch.tensor(v).to(self.device) for k, v in params_dict}
         self.model.load_state_dict(state_dict, strict=True)
+        self.model.to(self.device)
     
 
     def fit(self, parameters, config):
@@ -1356,8 +1358,8 @@ def build_client_fn_pfededitprox(
             mu=mu
         ).to_client()
     
+    return client_fn
 
-        print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
 
 class PFedEditProxClient(PFedEditClient):
     """
@@ -1452,3 +1454,356 @@ class PFedEditProxClient(PFedEditClient):
             "train_loss": train_loss,
             "train_accuracy": train_accuracy
         }
+
+def build_client_fn_talos_pfededit(
+    use_iid: bool,
+    optimizer_type: OptimizerType,
+    optimizer_config: Dict,
+    scheduler_type: SchedulerType,
+    scheduler_config: Dict,
+    iid_partitions: List[Dataset],
+    non_iid_partitions: List[Dataset],
+    model_fn: Callable[[], nn.Module],
+    device: torch_device,
+    valset: Dataset,
+    batch_size: int,
+    talos_config: dict,
+    pfededit_config: dict,
+    local_epochs: int = 1,
+    mu: float = 0.1
+) -> Callable[[Context], Client]:
+    """
+    Build a client function for TaLoS with PFedEdit.
+    """
+
+    def make_scheduler(optimizer: optim.Optimizer, scheduler_type: str, scheduler_config: dict) -> optim.lr_scheduler._LRScheduler:
+        if scheduler_type == "cosine":
+            return optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_config)
+        elif scheduler_type == "cosine_restart":
+            return optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **scheduler_config)
+        elif scheduler_type == "step":
+            return optim.lr_scheduler.StepLR(optimizer, **scheduler_config)
+        elif scheduler_type == "multistep":
+            return optim.lr_scheduler.MultiStepLR(optimizer, **scheduler_config)
+        elif scheduler_type == "exponential":
+            return optim.lr_scheduler.ExponentialLR(optimizer, **scheduler_config)
+        elif scheduler_type == "reduce_on_plateau":
+            return optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_config)
+        elif scheduler_type == "constant":
+            return optim.lr_scheduler.ConstantLR(optimizer, **scheduler_config)
+        elif scheduler_type == "linear":
+            return optim.lr_scheduler.LinearLR(optimizer, **scheduler_config)
+        else:
+            raise ValueError(f"Unsupported scheduler: {scheduler_type}")
+                             
+    def client_fn(context: Context) -> Client:
+        """
+        Construct a client instance based on the context provided by Flower.
+        """
+        cid = int(context.node_config["partition-id"])
+        print(f"LOG: Initializing client with CID={cid}")
+        
+        trainset = iid_partitions[cid] if use_iid else non_iid_partitions[cid]
+        print(f"{cid}-LOG: Data partition assigned to client {cid} -> {'IID' if use_iid else 'Non-IID'}")
+
+        model = model_fn()
+        print(f"{cid}-LOG: Model initialized for client {cid}")
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True)
+        valloader = DataLoader(valset, batch_size=batch_size)
+        print(f"{cid}-LOG: Dataloaders initialized for client {cid}")
+
+        # Create a NumPyClient instance
+        return TaLoSPFedEditClient(
+            cid=cid,
+            model=model,
+            trainloader=trainloader,
+            valloader=valloader,
+            device=device,
+            optimizer_type=optimizer_type.value,
+            optimizer_config=optimizer_config,
+            scheduler_config=scheduler_config,
+            scheduler_type=scheduler_type,
+            scheduler_fn=make_scheduler,
+            local_epochs=local_epochs,
+            talos_config=talos_config,
+            pfededit_config=pfededit_config,
+            mu=mu
+        ).to_client()
+
+        print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
+    return client_fn
+
+        
+class TaLoSPFedEditClient(fl.client.NumPyClient):
+    """
+    A Federated Learning client that uses TaLoS with PFedEdit during local updates.
+    """
+
+    def __init__(
+        self,
+        cid: int,
+        model: nn.Module,
+        trainloader: DataLoader,
+        valloader: DataLoader,
+        device: torch.device,
+        optimizer_config: Dict,
+        optimizer_type: str,
+        scheduler_config: Dict,
+        scheduler_type: str,
+        scheduler_fn,               
+        talos_config: dict,
+        pfededit_config: dict,
+        local_epochs: int = 1,
+        mu: float = 0.1,
+    ):
+        self.cid = cid
+        self.model = model.to(device)
+        self.trainloader = trainloader
+        self.valloader = valloader
+        self.device = device
+        self.optimizer_config = optimizer_config
+        self.optimizer_type = optimizer_type
+        self.scheduler_config = scheduler_config
+        self.scheduler_type = scheduler_type
+        self.scheduler_fn = scheduler_fn
+        self.local_epochs = local_epochs
+        self.mu = mu
+        self.pfededit_config = pfededit_config
+        self.talos_config = talos_config
+        self.top_k_layers = pfededit_config["top_k_layers"]
+        self.max_batches = pfededit_config["max_batches"]
+
+        print(f"{self.cid}-LOG: Initialized with FedProx μ = {self.mu}")
+    
+    def get_parameters(self, config):
+        """
+        Extract model parameters for sending to the server.
+
+        Args:
+            config (dict): Not used (placeholder).
+
+        Returns:
+            List[np.ndarray]: List of NumPy arrays representing model parameters.
+        """
+        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+
+
+    def set_parameters(self, parameters):
+        """Set the local model parameters."""
+        params_dict = zip(self.model.state_dict().keys(), parameters)
+        state_dict = {k: torch.tensor(v) for k, v in params_dict}
+        self.model.load_state_dict(state_dict, strict=True)
+
+    def fit(self, parameters, config):
+        """
+        Train the local model with TaLoS and PFedEdit for one round.
+        """
+        self.set_parameters(parameters)
+        self.model = self.model.float()
+        self.model = self.model.to(self.device)
+        self.model.train()
+        correct, total, loss_total = 0, 0, 0.0
+
+        # Retrieve current round and total rounds from config
+        current_round = config.get("current_round", 0)
+        total_rounds = config.get("total_rounds", 100)
+        print("Current Round:", current_round)
+        print("Total Rounds:", total_rounds)
+
+        #Scheduling the stochastic factor
+        initial_stochastic = 1.0
+        progress = (current_round - 1) / max(total_rounds - 1, 1)
+        current_stochastic = initial_stochastic * (1.0 - progress)
+        current_stochastic = max(current_stochastic, 0.0)
+
+        print(f"{self.cid}-LOG: Round {current_round} | Dynamic Stochastic Factor: {current_stochastic:.4f}")
+
+        params_to_train, top_layers, mode = self.select_params_to_train(current_stochastic)
+
+        if mode != "pfededit":
+            self.pruner = TaLoSPruner(
+                model=self.model,
+                device=self.device,
+                mode=mode,
+                final_sparsity=self.talos_config["final_sparsity"],
+                num_batches=self.talos_config["num_batches"],
+                rounds=self.talos_config["rounds"],
+            )
+        else:
+            self.pruner = TaLoSPruner(
+                model=self.model,
+                device=self.device,
+                mode=mode,
+                final_sparsity=self.talos_config["final_sparsity"],
+                num_batches=self.talos_config["num_batches"],
+                rounds=self.talos_config["rounds"],
+                layers_to_prune=top_layers,
+            )
+
+        print(f"{self.cid}-LOG: Starting TaLoS calibration in mode: {mode}")
+
+        self.pruner.calibrate_masks(self.trainloader, strategy=self.talos_config["calibration_mode"])
+
+
+        # === Optimizer Initialization ===
+        if self.optimizer_type == "ssgd":
+            optimizer = SparseSGDM(
+                params=params_to_train,
+                lr=self.optimizer_config["lr"],
+                momentum=self.optimizer_config["momentum"],
+                weight_decay=self.optimizer_config["weight_decay"],
+                masks=self.pruner.masks
+            )
+            print("{}-LOG: Using SparseSGDM optimizer".format(self.cid))
+
+        elif self.optimizer_type == "sadamw":
+            optimizer = SparseAdamW(
+                params=params_to_train,
+                lr=self.optimizer_config["lr"],
+                betas=self.optimizer_config["betas"],
+                eps=self.optimizer_config["eps"],
+                weight_decay=self.optimizer_config["weight_decay"],
+                masks=self.pruner.masks
+            )
+            print("{}-LOG: Using SparseAdamW optimizer".format(self.cid))
+        else:
+            raise ValueError(f"Optimizer type is not supported.")
+
+        scheduler = self.scheduler_fn(optimizer, self.scheduler_type, self.scheduler_config)
+
+        loss_total = 0.0
+        correct = 0
+        total = 0
+        global_weights = {name: p.clone().detach() for name, p in self.model.named_parameters()}
+
+        for epoch in range(self.local_epochs):
+            print(f"{self.cid}-LOG: Starting epoch {epoch + 1}/{self.local_epochs}")
+            for images, labels in self.trainloader:
+                images, labels = images.to(self.device).float(), labels.to(self.device)
+
+                optimizer.zero_grad()
+                output = self.model(images)
+                loss = nn.CrossEntropyLoss()(output, labels)
+
+                # FedProx proximal term
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and name in global_weights:
+                        prox_term = self.mu * 0.5 * torch.norm(param - global_weights[name]) ** 2
+                        loss += prox_term
+
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                loss_total += loss.item() * images.size(0)
+                _, predicted = torch.max(output.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        train_loss = loss_total / total
+        train_accuracy = correct / total
+        print(f"{self.cid}-LOG: Completed local training - Loss: {train_loss:.4f} | Accuracy: {train_accuracy:.4f}")
+        return self.get_parameters(config), len(self.trainloader.dataset), {
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy
+        }
+    
+    def select_params_to_train(self, stochastic_factor: float):
+        """
+        Select which parameters to train based on the TaLoS strategy.
+        """
+        sample = random.random()
+        print(f"{self.cid}-LOG: Random Sample: {sample:.4f}")
+
+        if sample < stochastic_factor:
+            print(f"{self.cid}-LOG: Stochastic Sampling Activated (stochastic_factor={stochastic_factor:.4f}), Full Model Training")
+            all_params = list(self.model.parameters())
+            return all_params, None, self.talos_config["mode"]
+        else:
+            print(f"{self.cid}-LOG: TaLoS Local Layer Selection (stochastic_factor={stochastic_factor:.4f})")
+            candidate_layers = list(range(len(self.model.blocks)))
+            loss_values = self._evaluate_layer_loss(candidate_layers, max_batches=self.max_batches)
+            top_layers = sorted(loss_values, key=loss_values.get)[:self.top_k_layers]
+            print(f"{self.cid}-LOG: Selected Layers (Min Loss): {top_layers}")
+            all_params = []
+            for idx in top_layers:
+                all_params += list(self.model.blocks[idx].parameters())
+            all_params += list(self.model.head.parameters())
+            all_params += list(self.model.norm.parameters())
+            return all_params, top_layers, "pfededit"
+    
+    def evaluate(self, parameters, config):
+        """
+        Evaluate the model on the client's validation data.
+        """
+        print(f"{self.cid}-LOG: Starting evaluation")
+        self.set_parameters(parameters)
+        self.model = self.model.float()
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        correct, total, loss_total = 0, 0, 0.0
+
+        with torch.no_grad():
+            for images, labels in self.valloader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                outputs = self.model(images)
+                loss = nn.CrossEntropyLoss()(outputs, labels)
+
+                loss_total += loss.item() * labels.size(0)
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        val_loss = loss_total / total
+        val_accuracy = correct / total
+        print(f"{self.cid}-LOG: Evaluation completed - Val Loss: {val_loss:.4f} | Val Accuracy: {val_accuracy:.4f}")
+
+        return val_loss, total, {
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy
+        }
+
+    def _evaluate_layer_loss(self, candidate_layers, max_batches=4):
+        """
+        Evaluate the loss for each layer.
+        """
+        loss_values = {}
+        criterion = nn.CrossEntropyLoss()
+        self.model.eval()
+
+        print("Max Batches:", max_batches)
+
+        with torch.no_grad():
+            for idx in candidate_layers:
+                layer_loss = 0.0
+                batch_count = 0
+                for images, labels in self.trainloader:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    output = self._forward_with_mask(idx, images)
+                    layer_loss += criterion(output, labels).item()
+                    batch_count += 1
+                    if batch_count >= max_batches:
+                        break
+                if batch_count == 0:
+                    loss_values[idx] = float("inf")
+                else:
+                    loss_values[idx] = layer_loss / batch_count
+
+        return loss_values
+    
+    def _forward_with_mask(self, active_layer_idx: int, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with only the active layer enabled.
+        """
+        x = x.to(self.device)
+        x = self.model.patch_embed(x)
+        for i, blk in enumerate(self.model.blocks):
+            if i == active_layer_idx:
+                x = blk(x)
+            else:
+                with torch.no_grad():
+                    x = blk(x)
+        x = self.model.norm(x)
+        x = self.model.head(x[:, 0])
+        return x
+    
