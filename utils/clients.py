@@ -422,7 +422,7 @@ class CIFARFederatedProxClient(CIFARFederatedClient):
         optimizer_fn,
         scheduler_fn,
         local_epochs: int,
-        mu: float = 0.1 
+        mu: float = 0.1,
     ):
         super().__init__(cid, model, trainloader, valloader, device, optimizer_type, 
                          scheduler_type, optimizer_config, scheduler_config,
@@ -1013,7 +1013,8 @@ def build_client_fn_pfededit(
     batch_size: int,
     local_epochs: int = 1,
     top_k_layers: int = 2,
-    max_batches: int = 4
+    max_batches: int = 4,
+    rounds_stochastic: int = 8
 ) -> Callable[[Context], Client]:
     """
     Build a client function for PFedEdit.
@@ -1084,7 +1085,8 @@ def build_client_fn_pfededit(
             scheduler_fn=make_scheduler,
             local_epochs=local_epochs,
             top_k_layers=top_k_layers,
-            max_batches=max_batches
+            max_batches=max_batches,
+            rounds_stochastic=rounds_stochastic
         ).to_client()
         
         print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
@@ -1108,7 +1110,8 @@ class PFedEditClient(fl.client.NumPyClient):
         scheduler_fn,
         local_epochs: int = 1,
         top_k_layers: int = 2,
-        max_batches: int = 4
+        max_batches: int = 4,
+        rounds_stochastic: int = 8
     ):
         self.cid = cid
         self.model = model.to(device)
@@ -1124,7 +1127,8 @@ class PFedEditClient(fl.client.NumPyClient):
         self.local_epochs = local_epochs
         self.top_k_layers = top_k_layers
         self.stochastic_factor = 1.0
-        self.max_batches = max_batches
+        self.max_batches = max_batches,
+        self.rounds_stochastic = rounds_stochastic
     
     def get_parameters(self, config):
         """
@@ -1153,7 +1157,7 @@ class PFedEditClient(fl.client.NumPyClient):
         self.model.train()
         # Retrieve current rouuf nd and total rounds from config
         current_round = config.get("current_round", 0)
-        total_rounds = config.get("total_rounds", 100)  # fallback
+        total_rounds = self.rounds_stochastic  # fallback
         print("Current Round:", current_round)
         print("Total Rounds:", total_rounds)
 
@@ -1298,7 +1302,8 @@ def build_client_fn_pfededitprox(
     batch_size: int,
     talos_config: dict,
     local_epochs: int = 1,
-    mu: float = 0.1
+    mu: float = 0.1,
+    rounds_stochastic: int = 8
 ) -> Callable[[Context], Client]:
 
     """
@@ -1355,7 +1360,8 @@ def build_client_fn_pfededitprox(
             scheduler_fn=make_scheduler,
             local_epochs=local_epochs,
             talos_config=talos_config,
-            mu=mu
+            mu=mu,
+            rounds_stochastic=rounds_stochastic
         ).to_client()
     
     return client_fn
@@ -1380,7 +1386,8 @@ class PFedEditProxClient(PFedEditClient):
         optimizer_fn,
         scheduler_fn,
         local_epochs: int = 1,
-        mu: float = 0.1
+        mu: float = 0.1,
+        rounds_stochastic: int = 8
     ):
         super().__init__(
             cid=cid,
@@ -1409,7 +1416,7 @@ class PFedEditProxClient(PFedEditClient):
 
         # Retrieve current round and total rounds from config
         current_round = config.get("current_round", 0)
-        total_rounds = config.get("total_rounds", 100)
+        total_rounds = self.rounds_stochastic  # fallback
         print("Current Round:", current_round)
         print("Total Rounds:", total_rounds)
         initial_stochastic = 1.0
@@ -1470,7 +1477,11 @@ def build_client_fn_talos_pfededit(
     talos_config: dict,
     pfededit_config: dict,
     local_epochs: int = 1,
-    mu: float = 0.1
+    mu: float = 0.1,
+    rounds_stochastic: int = 8,
+    deterministic_round: int = 4,
+    all_rounds_scheduling: bool = True,
+    reverse_mode: bool = False
 ) -> Callable[[Context], Client]:
     """
     Build a client function for TaLoS with PFedEdit.
@@ -1527,7 +1538,11 @@ def build_client_fn_talos_pfededit(
             local_epochs=local_epochs,
             talos_config=talos_config,
             pfededit_config=pfededit_config,
-            mu=mu
+            mu=mu,
+            rounds_stochastic = rounds_stochastic,
+            deterministic_round=deterministic_round,
+            all_rounds_scheduling=all_rounds_scheduling,
+            reverse_mode=reverse_mode
         ).to_client()
 
         print(f"{cid}-LOG: Client {cid} fully initialized and ready for training")
@@ -1555,6 +1570,10 @@ class TaLoSPFedEditClient(fl.client.NumPyClient):
         pfededit_config: dict,
         local_epochs: int = 1,
         mu: float = 0.1,
+        rounds_stochastic: int = 8,
+        deterministic_round: int = 4,
+        all_rounds_scheduling: bool = True,
+        reverse_mode: bool = False
     ):
         self.cid = cid
         self.model = model.to(device)
@@ -1572,6 +1591,10 @@ class TaLoSPFedEditClient(fl.client.NumPyClient):
         self.talos_config = talos_config
         self.top_k_layers = pfededit_config["top_k_layers"]
         self.max_batches = pfededit_config["max_batches"]
+        self.rounds_stochastic = rounds_stochastic
+        self.deterministic_round = deterministic_round
+        self.all_rounds_scheduling = all_rounds_scheduling
+        self.reverse_mode = reverse_mode
 
         print(f"{self.cid}-LOG: Initialized with FedProx μ = {self.mu}")
     
@@ -1603,18 +1626,41 @@ class TaLoSPFedEditClient(fl.client.NumPyClient):
         self.model = self.model.to(self.device)
         self.model.train()
         correct, total, loss_total = 0, 0, 0.0
-
-        # Retrieve current round and total rounds from config
-        current_round = config.get("current_round", 0)
-        total_rounds = config.get("total_rounds", 100)
-        print("Current Round:", current_round)
-        print("Total Rounds:", total_rounds)
-
-        #Scheduling the stochastic factor
         initial_stochastic = 1.0
-        progress = (current_round - 1) / max(total_rounds - 1, 1)
-        current_stochastic = initial_stochastic * (1.0 - progress)
-        current_stochastic = max(current_stochastic, 0.0)
+
+        if self.all_rounds_scheduling:
+            # Retrieve current round and total rounds from config
+            current_round = config.get("current_round", 0)
+            total_rounds = self.rounds_stochastic
+            print("Current Round:", current_round)
+            print("Total Rounds:", total_rounds)
+
+            #Scheduling the stochastic factor
+            if self.reverse_mode:
+                # Reverse mode for scheduling
+                print(f"{self.cid}-LOG: Using reverse mode for scheduling")
+                progress = (current_round - 1) / max(total_rounds - 1, 1)
+                current_stochastic = min(max(progress, 0.0), 1.0)
+            else:
+                # Normal mode for scheduling
+                print(f"{self.cid}-LOG: Using normal mode for scheduling")
+                progress = (current_round - 1) / max(total_rounds - 1, 1)
+                current_stochastic = initial_stochastic * (1.0 - progress)
+                current_stochastic = max(current_stochastic, 0.0)
+        else:
+            # Use deterministic round for scheduling
+            current_round = config.get("current_round", 0)
+            total_rounds = self.deterministic_round
+            print("Current Round:", current_round)
+            print("Total Rounds:", total_rounds)
+            if self.reverse_mode:
+                progress = (current_round - 1) / max(total_rounds - 1, 1)
+                current_stochastic = min(max(progress, 0.0), 1.0)
+            else:
+                print(f"{self.cid}-LOG: Using normal mode for scheduling")
+                progress = (current_round - 1) / max(total_rounds - 1, 1)
+                current_stochastic = initial_stochastic * (1.0 - progress)
+                current_stochastic = max(current_stochastic, 0.0)
 
         print(f"{self.cid}-LOG: Round {current_round} | Dynamic Stochastic Factor: {current_stochastic:.4f}")
 
