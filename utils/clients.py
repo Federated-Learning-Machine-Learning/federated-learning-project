@@ -1,3 +1,15 @@
+"""
+clients.py contains the implementation of Flower clients for federated learning experiments.
+- CIFARFederatedClient: A standard client for CIFAR-based image classification.
+- CIFARFederatedProxClient: A client that implements FedProx regularization.
+- CIFARTaLoSClient: A client that uses TaLoS model editing during local updates. 
+- CIFARTalosProxClient: A client that combines TaLoS with FedProx regularization.
+- PFedEditClient: A client that implements PFedEdit for selective layer training.
+- PFedEditProxClient: A client that combines PFedEdit with FedProx
+- TalosPFedEditClient: A client that combines TaLoS with PFedEdit for selective layer training.
+"""
+
+
 import flwr as fl
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +28,7 @@ from editing import SparseSGDM, TaLoSPruner, SparseAdamW
 from torch.optim import Optimizer
 import numpy as np
 import random
+
 
 class ClientType(Enum):
     STANDARD = "standard"
@@ -160,6 +173,7 @@ class CIFARFederatedClient(fl.client.NumPyClient):
 
     This client requires explicit definitions for both optimizer and scheduler,
     allowing full control of local training behavior in FL experiments.
+
     """
 
     def __init__(
@@ -408,6 +422,25 @@ def build_client_fedprox_fn(
     return client_fn
 
 class CIFARFederatedProxClient(CIFARFederatedClient):
+
+    """
+    A Flower client that implements FedProx regularization during local training.
+    args: 
+        cid: Client id.
+        model (nn.Module): PyTorch model instance.
+        trainloader (DataLoader): Training dataloader.
+        valloader (DataLoader): Validation dataloader.
+        device (torch.device): Device to run training on (CPU or CUDA).
+        optimizer_type (OptimizerType): Enum specifying the optimizer to use.
+        scheduler_type (SchedulerType): Enum specifying the scheduler to use.
+        optimizer_config (Dict): Dictionary of optimizer hyperparameters (e.g., lr, momentum).
+        scheduler_config (Dict): Dictionary of scheduler hyperparameters (e.g., T_max, gamma).
+        optimizer_fn (Callable): Function that returns an optimizer when given a model.
+        scheduler_fn (Callable): Function that returns a scheduler when given an optimizer.
+        local_epochs (int): Number of local epochs to perform.
+        mu (float): FedProx regularization parameter.
+    
+    """
     def __init__(
         self,
         cid,
@@ -566,6 +599,20 @@ def build_client_talos_fn(
 class CIFARTaLoSClient(fl.client.NumPyClient):
     """
     A Federated Learning client that uses TaLoS Model Editing during local updates.
+    args:
+        cid: Client id.
+        model (nn.Module): PyTorch model instance.
+        trainloader (DataLoader): Training dataloader.
+        valloader (DataLoader): Validation dataloader.
+        device (torch.device): Device to run training on (CPU or CUDA).
+        optimizer_type (str): Type of optimizer to use (e.g., 'ssgd', 'sadamw').
+        scheduler_type (str): Type of scheduler to use (e.g., 'cosine', 'step').
+        optimizer_config (dict): Configuration for the optimizer.
+        scheduler_config (dict): Configuration for the scheduler.
+        scheduler_fn (Callable): Function to create the scheduler.
+        local_epochs (int): Number of local epochs to perform.
+        talos_config (dict): Configuration for TaLoS model editing.
+    
     """
 
     def __init__(
@@ -901,8 +948,20 @@ def build_client_talos_prox_fn(
 
 class CIFARTaLoSProxClient(CIFARTaLoSClient):
     """
-    A Federated Learning client that uses TaLoS Model Editing during local updates.
-    Includes FedProx regularization term.
+    A Flower client that implements FedProx regularization during local training.
+    args:  
+        cid: Client id.
+        model (nn.Module): PyTorch model instance.
+        trainloader (DataLoader): Training dataloader.
+        valloader (DataLoader): Validation dataloader.
+        device (torch.device): Device to run training on (CPU or CUDA).
+        optimizer_type (str): Type of optimizer to use (e.g., 'ssgd', 'sadamw').
+        scheduler_type (str): Type of scheduler to use (e.g., 'cosine', 'step').
+        optimizer_config (dict): Configuration for the optimizer.
+        scheduler_config (dict): Configuration for the scheduler.
+        scheduler_fn (Callable): Function to create the scheduler.
+        local_epochs (int): Number of local epochs to perform.
+        mu (float): FedProx regularization parameter.
     """
 
     def __init__(
@@ -1095,6 +1154,25 @@ def build_client_fn_pfededit(
     
 
 class PFedEditClient(fl.client.NumPyClient):
+    """
+    A Flower client that implements the PFedEdit strategy for local model training.
+    args:
+        cid (int): Client ID.
+        model (nn.Module): Local model to be trained.
+        trainloader (DataLoader): DataLoader for training data.
+        valloader (DataLoader): DataLoader for validation data.
+        device (torch.device): Device to run the model on (CPU or GPU).
+        optimizer_config (Dict): Configuration for the optimizer.
+        optimizer_type (str): Type of optimizer to use (e.g., 'sgd', 'adam').
+        scheduler_config (Dict): Configuration for the learning rate scheduler.
+        scheduler_type (str): Type of scheduler to use (e.g., 'cosine', 'step').
+        optimizer_fn (Callable): Function to create the optimizer.
+        scheduler_fn (Callable): Function to create the scheduler.
+        local_epochs (int): Number of local training epochs.
+        top_k_layers (int): Number of top layers to train based on PFedEdit.
+        max_batches (int): Maximum number of batches to use for training.
+        rounds_stochastic (int): Number of rounds 
+    """
     def __init__(
         self,
         cid: int,
@@ -1370,6 +1448,23 @@ def build_client_fn_pfededitprox(
 class PFedEditProxClient(PFedEditClient):
     """
     A Federated Learning client that uses PFedEdit with FedProx during local updates.
+
+    args:
+        cid (int): Client ID.
+        model (nn.Module): Local model.
+        trainloader (DataLoader): DataLoader for training data.
+        valloader (DataLoader): DataLoader for validation data.
+        device (torch.device): Device to run the model on.
+        optimizer_config (Dict): Configuration for the optimizer.
+        optimizer_type (str): Type of optimizer to use.
+        scheduler_config (Dict): Configuration for the learning rate scheduler.
+        scheduler_type (str): Type of scheduler to use.
+        optimizer_fn: Function to create the optimizer.
+        scheduler_fn: Function to create the scheduler.
+        local_epochs (int): Number of local epochs to train.
+        mu (float): FedProx regularization parameter.
+        rounds_stochastic (int): Number of stochastic rounds for dynamic sampling.
+
     """
 
     def __init__(
@@ -1552,6 +1647,30 @@ def build_client_fn_talos_pfededit(
 class TaLoSPFedEditClient(fl.client.NumPyClient):
     """
     A Federated Learning client that uses TaLoS with PFedEdit during local updates.
+
+    args:
+        cid (int): Client ID.
+        model (nn.Module): Local model.
+        trainloader (DataLoader): DataLoader for training data.
+        valloader (DataLoader): DataLoader for validation data.
+        device (torch.device): Device to run the model on.
+        optimizer_config (Dict): Configuration for the optimizer.
+        optimizer_type (str): Type of optimizer to use.
+        scheduler_config (Dict): Configuration for the learning rate scheduler.
+        scheduler_type (str): Type of learning rate scheduler to use.
+        scheduler_fn: Function to create the scheduler.
+        talos_config (dict): Configuration for TaLoS.
+        pfededit_config (dict): Configuration for PFedEdit.
+        local_epochs (int, optional): Number of local epochs. Defaults to 1.
+        mu (float, optional): FedProx regularization parameter. Defaults to 0.1.
+        rounds_stochastic (int, optional): Number of rounds of federated learning process. Defaults to 8.
+        deterministic_round (int, optional): Round for deterministic scheduling. Defaults to 4.
+        all_rounds_scheduling (bool, optional): Whether to use all rounds scheduling. Defaults to True.
+        reverse_mode (bool, optional): Whether to use reverse mode for scheduling. Defaults to False.
+
+    returns:
+        fl.client.Client: A fully initialized Flower client with TaLoS and PFedEdit.
+    
     """
 
     def __init__(
@@ -1666,7 +1785,9 @@ class TaLoSPFedEditClient(fl.client.NumPyClient):
 
         params_to_train, top_layers, mode = self.select_params_to_train(current_stochastic)
 
-        if mode != "pfededit":
+
+        #if mode is not pfededit, use Talos (i.e. apply the pruning) along all the layers
+        if mode != "pfededit": 
             self.pruner = TaLoSPruner(
                 model=self.model,
                 device=self.device,
@@ -1675,7 +1796,7 @@ class TaLoSPFedEditClient(fl.client.NumPyClient):
                 num_batches=self.talos_config["num_batches"],
                 rounds=self.talos_config["rounds"],
             )
-        else:
+        else: #the mode is pfededit, use Talos (i.e. apply the pruning) only on the top selected k layers
             self.pruner = TaLoSPruner(
                 model=self.model,
                 device=self.device,
@@ -1688,7 +1809,7 @@ class TaLoSPFedEditClient(fl.client.NumPyClient):
 
         print(f"{self.cid}-LOG: Starting TaLoS calibration in mode: {mode}")
 
-        self.pruner.calibrate_masks(self.trainloader, strategy=self.talos_config["calibration_mode"])
+        self.pruner.calibrate_masks(self.trainloader, strategy=self.talos_config["calibration_mode"]) # calibrate the masks based on the selected mode
 
 
         # === Optimizer Initialization ===

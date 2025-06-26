@@ -6,7 +6,7 @@ Federated Learning (FL) enables decentralized model training without sharing raw
 
 Our approach is evaluated on ViT-S/16 pretrained with DINO and tested on CIFAR-100.
 
-## 📁 Repository Structure
+## Repository Structure
 
 - `notebooks/`  
   Jupyter notebooks for running all experiments—centralized and federated—under different settings. In particular
@@ -18,6 +18,8 @@ Our approach is evaluated on ViT-S/16 pretrained with DINO and tested on CIFAR-1
   - `PRODUCTION_FL.ipynb`: Federated Learning **without** model editing (standard FedAvg baseline).
   
   - `PRODUCTION_FL_Editing.ipynb`: Federated Learning **with** model editing, including TaLoS and pFedEdit strategies.
+  
+  Each notebook provides a configurable section where all relevant hyperparameters for the experiment can be specified.
 
 - `utils/`  
   Supporting Python modules used across notebooks, including:
@@ -29,22 +31,21 @@ Our approach is evaluated on ViT-S/16 pretrained with DINO and tested on CIFAR-1
   - `data_preprocessing.py`: Includes image preprocessing utilities such as data augmentation, normalization, and dataset preparation for CIFAR-100.
   - `wandb_logger.py`: Contains the logic and setup for **logging metrics, losses, and hyperparameters** to **Weights & Biases**, allowing real-time monitoring of training and evaluation.
 
-- `theory/`: Contains research papers and project planning resources.
-  
-  - `papers/`: Research PDFs grouped by topic
-  - `Project Guidelines.pdf`: Internal project roadmap and goals
+## Client Configuration: `TalosPFedEdit`
 
-## 🚀 Quick Start (Colab)
+To test the `TalosPFedEdit` mode, simply use the `TalosPFedEdit` client in your experiment script and set the `mode` to `full` inside the `talos_config`.
+
+## Quick Start (Colab)
 
 1. Open any notebook from the [`notebooks/`](./notebooks) folder in **Google Colab**.
 2. Upload the required utility files from the [`utils/`](./utils) folder to your Colab session.
 3. Run all cells. 
 
-## 📈 Results
+## Results
 
 Training logs and visualizations are available on Weights & Biases:  
-👉 [View Experiments](https://wandb.ai/polito-fl/federated-learning-project/overview)
+ [View Experiments](https://wandb.ai/polito-fl/federated-learning-project/overview)
 
-## 📚 References
+## References
 
 Key references and papers are included in the [`theory/papers/`](./theory/papers/) folder.
